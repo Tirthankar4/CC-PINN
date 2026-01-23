@@ -1,0 +1,2573 @@
+from scipy import signal
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from torch.autograd import Variable
+import torch
+import scipy
+import os
+import time
+from numerical_solvers.LAX import lax_solution, lax_solution_3d_sinusoidal, lax_solver
+from numerical_solvers.LAX import lax_solution1D_sinusoidal as lax_solution1D_sin
+from numerical_solvers.LAX_torch import lax_solution_torch, lax_solution_3d_sinusoidal_torch, lax_solver_torch
+def _clear_cuda_cache():
+    """
+    Comprehensive GPU cache clearing before FD solver runs.
+    
+    This function does more than just empty_cache() - it also:
+    1. Forces garbage collection
+    2. Synchronizes CUDA operations
+    3. Clears the cache allocator
+    
+    This helps prevent OOM errors when FD solver needs GPU memory.
+    """
+    if torch.cuda.is_available():
+        import gc
+        # Force garbage collection first to free Python objects
+        gc.collect()
+        # Clear PyTorch's cache allocator
+        torch.cuda.empty_cache()
+        # Synchronize to ensure all operations complete
+        torch.cuda.synchronize()
+
+def find_max_contrast_slice(rho_volume, z_coords):
+    """
+    Find z-slice with maximum density contrast (range).
+    
+    Best for showing interesting physics - regions with both 
+    high density (collapse) and low density (rarefaction).
+    
+    Args:
+        rho_volume: (Nx, Ny, Nz) 3D density field
+        z_coords: (Nz,) z-coordinate array
+    
+    Returns:
+        z_idx: Index of optimal z-slice
+        z_val: Value of z at that slice
+        contrast: Density contrast at that slice
+    """
+    contrast_per_z = []
+    for z_idx in range(rho_volume.shape[2]):
+        # np.ptp = peak-to-peak (max - min)
+        contrast = np.ptp(rho_volume[:, :, z_idx])
+        contrast_per_z.append(contrast)
+    
+    best_z_idx = np.argmax(contrast_per_z)
+    best_z_val = z_coords[best_z_idx]
+    max_contrast = contrast_per_z[best_z_idx]
+    
+    return best_z_idx, best_z_val, max_contrast
+
+
+def find_max_density_slice(rho_volume, z_coords):
+    """
+    Find z-slice with maximum integrated density.
+    
+    Good for showing where collapse is strongest.
+    
+    Args:
+        rho_volume: (Nx, Ny, Nz) 3D density field
+        z_coords: (Nz,) z-coordinate array
+    
+    Returns:
+        z_idx: Index of optimal z-slice
+        z_val: Value of z at that slice
+        total_density: Integrated density at that slice
+    """
+    density_per_z = np.sum(rho_volume, axis=(0, 1))
+    
+    best_z_idx = np.argmax(density_per_z)
+    best_z_val = z_coords[best_z_idx]
+    max_density = density_per_z[best_z_idx]
+    
+    return best_z_idx, best_z_val, max_density
+
+
+def analyze_z_variation(rho_volume, z_coords, t, save_dir=None):
+    """
+    Diagnostic tool: visualize how density varies across z.
+    
+    Call this once to understand your 3D data before choosing
+    which selection method to use.
+    
+    Args:
+        rho_volume: (Nx, Ny, Nz) 3D density field
+        z_coords: (Nz,) z-coordinate array
+        t: Current time (for labeling)
+        save_dir: Optional directory to save figure
+    
+    Returns:
+        fig: matplotlib figure
+    """
+    # Compute metrics for each z-slice
+    density_per_z = np.sum(rho_volume, axis=(0, 1))
+    contrast_per_z = [np.ptp(rho_volume[:, :, i]) for i in range(len(z_coords))]
+    
+    # Find optimal slices
+    z_max_dens = z_coords[np.argmax(density_per_z)]
+    z_max_cont = z_coords[np.argmax(contrast_per_z)]
+    z_median = z_coords[np.argmin(np.abs(density_per_z - np.median(density_per_z)))]
+    
+    # Create diagnostic plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Integrated density vs z
+    ax1.plot(z_coords, density_per_z, 'o-', linewidth=2, markersize=4)
+    ax1.axvline(z_max_dens, color='red', linestyle='--', alpha=0.7, 
+                label=f'Max density: z={z_max_dens:.3f}')
+    ax1.axvline(z_median, color='green', linestyle='--', alpha=0.7,
+                label=f'Median: z={z_median:.3f}')
+    ax1.set_xlabel('z', fontsize=12)
+    ax1.set_ylabel('Integrated Density', fontsize=12)
+    ax1.set_title(f'Density Distribution at t={t:.2f}', fontsize=13)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # Right: Contrast vs z
+    ax2.plot(z_coords, contrast_per_z, 's-', color='orange', linewidth=2, markersize=4)
+    ax2.axvline(z_max_cont, color='red', linestyle='--', alpha=0.7,
+                label=f'Max contrast: z={z_max_cont:.3f}')
+    ax2.set_xlabel('z', fontsize=12)
+    ax2.set_ylabel('Density Contrast (max - min)', fontsize=12)
+    ax2.set_title(f'Structure Distribution at t={t:.2f}', fontsize=13)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    
+    plt.tight_layout()
+    
+    # Print summary
+    print(f"\\n{'='*60}")
+    print(f"Z-Slice Analysis at t={t:.2f}")
+    print(f"{'='*60}")
+    print(f"Max density slice:   z = {z_max_dens:.3f} (density = {np.max(density_per_z):.2e})")
+    print(f"Max contrast slice:  z = {z_max_cont:.3f} (contrast = {np.max(contrast_per_z):.2e})")
+    print(f"Median density slice: z = {z_median:.3f}")
+    print(f"Density range across z: [{np.min(density_per_z):.2e}, {np.max(density_per_z):.2e}]")
+    print(f"Contrast range across z: [{np.min(contrast_per_z):.2e}, {np.max(contrast_per_z):.2e}]")
+    print(f"{'='*60}\\n")
+    
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        savepath = os.path.join(save_dir, f'z_variation_analysis_t{t:.2f}.png')
+        plt.savefig(savepath, dpi=300, bbox_inches='tight')
+        print(f"Saved z-variation analysis to {savepath}")
+    
+    return fig
+
+
+def _timed_call(label, fn, *args, **kwargs):
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    elapsed = time.perf_counter() - start
+    print(f"[Timing] {label} took {elapsed:.2f}s")
+    return result
+
+from config import (SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o, 
+                    TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, POWER_EXPONENT, 
+                    N_GRID, N_GRID_3D, DIMENSION, SLICE_Y, SLICE_Z)
+from config import RANDOM_SEED, SHOW_LINEAR_THEORY
+
+# Global variable to store shared velocity fields for plotting
+_shared_vx_np = None
+_shared_vy_np = None
+_shared_vz_np = None
+
+def _build_input_list(x_tensor, t_tensor, y_tensor=None, z_tensor=None):
+    coords = [x_tensor]
+    if DIMENSION >= 2:
+        if y_tensor is None:
+            y_tensor = torch.full_like(x_tensor, SLICE_Y)
+        coords.append(y_tensor)
+    if DIMENSION >= 3:
+        if z_tensor is None:
+            z_tensor = torch.full_like(x_tensor, SLICE_Z)
+        coords.append(z_tensor)
+    coords.append(t_tensor)
+    return coords
+
+def _split_outputs(outputs):
+    rho = outputs[:, 0:1]
+    vx = outputs[:, 1:2]
+    vy = outputs[:, 2:3] if DIMENSION >= 2 else None
+    if DIMENSION == 1:
+        phi = outputs[:, 2:3]
+        vz = None
+    elif DIMENSION == 2:
+        phi = outputs[:, 3:4]
+        vz = None
+    else:
+        vz = outputs[:, 3:4]
+        phi = outputs[:, 4:5]
+    return rho, vx, vy, vz, phi
+
+def set_shared_velocity_fields(vx_np, vy_np, vz_np=None):
+    """
+    Set shared velocity fields for consistent FD plotting.
+    
+    Args:
+        vx_np: X-velocity field (2D or 3D numpy array)
+        vy_np: Y-velocity field (2D or 3D numpy array)
+        vz_np: Z-velocity field (3D numpy array, optional for 2D)
+    """
+    global _shared_vx_np, _shared_vy_np, _shared_vz_np
+    _shared_vx_np = vx_np
+    _shared_vy_np = vy_np
+    _shared_vz_np = vz_np
+
+def _call_unified_3d_solver(time, lam, num_of_waves, rho_1, nu=0.5, 
+                            use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                            save_times=None):
+    """
+    Helper function to call unified 3D LAX solver with proper IC type.
+    
+    Args:
+        time: Final simulation time
+        lam: Wavelength
+        num_of_waves: Number of waves in domain
+        rho_1: Density perturbation amplitude
+        nu: Courant number (default: 0.5)
+        use_velocity_ps: Whether to use power spectrum IC (defaults to config)
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS amplitude (defaults to a*cs)
+        random_seed: Random seed (defaults to RANDOM_SEED)
+        save_times: Optional list of times to save snapshots (default: None)
+    
+    Returns:
+        If save_times is None: SimulationResult object
+        If save_times is provided: Dict mapping time -> SimulationResult
+    """
+    # Use config defaults if not specified
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Set up domain parameters
+    Lx = Ly = Lz = lam * num_of_waves
+    Nx = Ny = Nz = FD_N_3D
+    
+    domain_params = {
+        'Lx': Lx, 'Ly': Ly, 'Lz': Lz,
+        'nx': Nx, 'ny': Ny, 'nz': Nz
+    }
+    
+    # Set up physics parameters
+    physics_params = {
+        'c_s': cs,
+        'rho_o': rho_o,
+        'const': const,
+        'G': G,
+        'rho_1': rho_1,
+        'lam': lam
+    }
+    
+    # Set up options
+    options = {
+        'gravity': True,
+        'nu': nu,
+        'comparison': False,
+        'isplot': False
+    }
+    
+    # Set up IC parameters based on perturbation type
+    if use_velocity_ps:
+        ic_type = 'power_spectrum'
+        ic_params = {
+            'power_index': ps_index,
+            'amplitude': vel_rms,
+            'random_seed': random_seed,
+            'vx0_shared': _shared_vx_np,
+            'vy0_shared': _shared_vy_np,
+            'vz0_shared': _shared_vz_np
+        }
+    else:
+        ic_type = 'sinusoidal'
+        ic_params = {
+            'KX': KX,
+            'KY': KY,
+            'KZ': KZ
+        }
+    
+    # Call unified solver (GPU or CPU)
+    if torch.cuda.is_available():
+        _clear_cuda_cache()
+        result = _timed_call(
+            "LAX 3D (unified torch)",
+            lax_solver_torch,
+            time=time, domain_params=domain_params,
+            physics_params=physics_params,
+            ic_type=ic_type, ic_params=ic_params,
+            options=options, save_times=save_times
+        )
+    else:
+        # CPU solver doesn't support save_times yet, so we'll need to handle it differently
+        # For now, if save_times is provided, we'll use the torch version even if on CPU
+        if save_times is not None:
+            result = _timed_call(
+                "LAX 3D (unified torch cpu)",
+                lax_solver_torch,
+                time=time, domain_params=domain_params,
+                physics_params=physics_params,
+                ic_type=ic_type, ic_params=ic_params,
+                options=options, save_times=save_times
+            )
+        else:
+            result = _timed_call(
+                "LAX 3D (unified cpu)",
+                lax_solver,
+                time=time, domain_params=domain_params,
+                physics_params=physics_params,
+                ic_type=ic_type, ic_params=ic_params,
+                options=options
+            )
+    
+    return result
+
+def get_fd_default_params():
+    """
+    Get default FD parameters that match PINN training configuration.
+    This ensures consistency between PINN and FD initial conditions.
+    
+    Returns:
+        dict with keys: use_velocity_ps, ps_index, vel_rms, random_seed
+    """
+    return {
+        'use_velocity_ps': (str(PERTURBATION_TYPE).lower() == "power_spectrum"),
+        'ps_index': POWER_EXPONENT,
+        'vel_rms': a * cs,
+        'random_seed': RANDOM_SEED
+    }
+
+has_gpu = torch.cuda.is_available()
+has_mps = torch.backends.mps.is_built()
+device = "mps" if torch.backends.mps.is_built() \
+    else "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def predict_xpinn(nets, x, y, t, xmin, xmax, ymin, ymax):
+    """
+    Legacy compatibility wrapper - XPINN no longer supported.
+    Now simply calls the single network (handles list with one network).
+    
+    Args:
+        nets: Single network or list with single network
+        x, y, t: Coordinate tensors [N, 1]
+        xmin, xmax, ymin, ymax: Domain bounds (ignored)
+    
+    Returns:
+        Predictions [N, 4] (rho, vx, vy, phi)
+    """
+    if isinstance(nets, list):
+        if len(nets) != 1:
+            raise ValueError("Multi-network XPINN is no longer supported")
+        net = nets[0]
+    else:
+        net = nets
+    return net([x, y, t])
+
+
+def add_interface_lines(ax, xmin, xmax, ymin, ymax):
+    """
+    Legacy compatibility function - does nothing now that XPINN is removed.
+    
+    Args:
+        ax: Matplotlib axis (unused)
+        xmin, xmax, ymin, ymax: Domain bounds (unused)
+    """
+    # XPINN removed - this function is now a no-op for compatibility
+    pass
+
+
+def plot_function(net, time_array, initial_params, velocity=False, isplot=False, animation=False):
+    """
+    Plot function for 1D slices through 2D domain
+    
+    Args:
+        net: Trained neural network OR list of networks (for XPINN)
+        time_array: Array of times to plot
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        velocity: Whether to plot velocity
+        isplot: Whether to save plots
+        animation: Whether this is for animation
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False  
+    # rho_o imported from config.py
+    num_of_waves_x = (xmax-xmin)/lam
+    num_of_waves_y = (ymax-ymin)/lam
+    if animation:
+        ## Converting the float (time-input) to an numpy array for animation
+        ## Ignore this when the function is called in isolation
+        time_array = np.array([time_array])
+        # print("time",np.asarray(time_array))
+    
+    rho_max_Pinns = []    
+    peak_lst=[]
+    pert_xscale=[]
+    for t in time_array:
+        print("Plotting at t=", t)
+        
+        # Create 1D slice through the domain (like in notebook: Y = 0.6)
+        X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
+        Y = SLICE_Y * np.ones(1000).reshape(1000, 1)  # Fixed Y slice
+        if DIMENSION >= 3:
+            Z = SLICE_Z * np.ones(1000).reshape(1000, 1)
+        t_ = t * np.ones(1000).reshape(1000, 1)
+        
+        pt_x_collocation = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(Z).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+        pt_t_collocation = Variable(torch.from_numpy(t_).float(), requires_grad=True).to(device)
+        
+        # Evaluate network(s)
+        if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN visualizations currently support up to 2D.")
+            output_0 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            # Ensure inputs are on the same device as the model
+            net_device = next(nets[0].parameters()).device
+            pt_x_collocation = pt_x_collocation.to(net_device)
+            pt_t_collocation = pt_t_collocation.to(net_device)
+            if pt_y_collocation is not None:
+                pt_y_collocation = pt_y_collocation.to(net_device)
+            if pt_z_collocation is not None:
+                pt_z_collocation = pt_z_collocation.to(net_device)
+            inputs = _build_input_list(
+                pt_x_collocation,
+                pt_t_collocation,
+                pt_y_collocation,
+                pt_z_collocation
+            )
+            output_0 = nets[0](inputs)
+        
+        rho_tensor, vx_tensor, vy_tensor, vz_tensor, phi_tensor = _split_outputs(output_0)
+        rho_pred0 = rho_tensor.detach().cpu().numpy()
+        v_pred_x0 = vx_tensor.detach().cpu().numpy()
+        v_pred_y0 = vy_tensor.detach().cpu().numpy() if vy_tensor is not None else None
+        phi_pred0 = phi_tensor.detach().cpu().numpy()
+ 
+        rho_max_PN = np.max(rho_pred0)
+        
+        ## Theoretical Values
+        #rho_theory = np.max(rho_o + rho_1*np.exp(alpha * t)*np.cos(2*np.pi*X[:, 0:1]/lam))
+        #rho_theory0 = np.max(rho_o + rho_1*np.exp(alpha * 0)*np.cos(2*np.pi*X[:, 0:1]/lam)) ## at t =0 
+        
+        #diff=abs(rho_max_PN-rho_theory)/abs(rho_max_PN+rho_theory) * 2  ## since the den is rhomax+rhotheory
+
+        
+#         ### Difference between peaks for the PINNs solution
+        
+#         rho_pred0Flat=rho_pred0.reshape(-1)
+#         peaks,_=scipy.signal.find_peaks(rho_pred0Flat)
+#         peak_lst.append(peaks)
+        
+#         growth_pert=(rho_theory-rho_theory0)/rho_theory0*100 ## growth percentage
+        
+#         peak_diff=(rho_pred0Flat[peaks[1]]-rho_pred0Flat[peaks[0]])/(rho_pred0Flat[peaks[1]]+rho_pred0Flat[peaks[0]])
+
+        #g_pred0=phi_x = dde.grad.jacobian(phi_pred0, X, i=0, j=0)
+        if isplot:              
+            # Create output folder if it doesn't exist
+            os.makedirs(output_folder, exist_ok=True)
+            
+            # Density plot
+            plt.figure(1)
+            plt.plot(X, rho_pred0, label="t={}".format(round(t,2)))
+            plt.ylabel(r"$\rho$")
+            plt.xlabel("x")
+            plt.grid()
+            plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
+            plt.title(r"PINNs Solution for $\lambda$ = {} $\lambda_J$".format(round(lam/(2*np.pi),2)))
+            #plt.savefig(output_folder+'/PINNS_density'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
+
+            if velocity == True:
+                # Velocity plots
+                plt.figure(2)
+                plt.plot(X, v_pred_x0, '--', label="t={}".format(round(t,2)))
+                plt.ylabel("$v_x$")
+                plt.xlabel("x")
+                plt.title("PINNs Solution Velocity")
+                plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
+                #plt.savefig(output_folder+'/PINNS_velocity'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
+
+            # Potential plot
+            plt.figure(3)
+            plt.plot(X, phi_pred0, '--', label="t={}".format(round(t,2)))
+            plt.ylabel(r"$\phi$")
+            plt.xlabel("x")
+            plt.title("PINNs Solution Potential")
+            plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
+            #plt.savefig(output_folder+'/phi'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
+
+        
+        else:  
+            if animation:
+                return X, rho_pred0, v_pred_x0, v_pred_y0, phi_pred0, rho_max_PN
+            else:
+                return X, rho_pred0, rho_max_PN
+
+
+def Two_D_surface_plots(net, time, initial_params, ax=None, which="density"):
+    """
+    Create 2D surface plots with velocity vectors
+
+    Args:
+        net: Trained neural network OR list of networks (for XPINN)
+        time: Time to plot
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        ax: Optional axis to plot on
+        which: "density" or "velocity"
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Use N_GRID for consistency with FD solver resolution
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
+    tau, phi = np.meshgrid(xs, ys) 
+    Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+    t_00 = time * np.ones(Q**2).reshape(Q**2, 1)
+    
+    # Convert to tensors
+    pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+    pt_z_collocation = Variable(torch.from_numpy(np.full((Q**2,1), SLICE_Z)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+    pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+    
+    # Evaluate network(s)
+    if use_xpinn:
+        if DIMENSION >= 3:
+            raise NotImplementedError("XPINN visualizations currently support up to 2D.")
+        output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+    else:
+        # Ensure inputs are on the same device as the model
+        net_device = next(nets[0].parameters()).device
+        pt_x_collocation = pt_x_collocation.to(net_device)
+        pt_t_collocation = pt_t_collocation.to(net_device)
+        if pt_y_collocation is not None:
+            pt_y_collocation = pt_y_collocation.to(net_device)
+        if pt_z_collocation is not None:
+            pt_z_collocation = pt_z_collocation.to(net_device)
+        output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
+    
+    rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
+    rho = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+    U = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+    if vy_tensor is not None:
+        V = vy_tensor.detach().cpu().numpy().reshape(Q, Q)
+    else:
+        V = np.zeros_like(U)
+
+    if ax is None:  # for single plot
+        plt.figure(figsize=(5, 5))
+        ax = plt.gca() 
+
+    # Clean velocity fields and avoid zero-length arrows
+    U_clean = np.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
+    V_clean = np.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
+    Vmag = np.sqrt(U_clean**2 + V_clean**2)
+    mask = Vmag > 1e-12
+
+    if which == "density":
+        pc = ax.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr', vmin=np.min(rho), vmax=np.max(rho))
+        skip = (slice(None, None, 5), slice(None, None, 5))
+        ax.quiver(
+            tau[skip][mask[skip]], phi[skip][mask[skip]],
+            U_clean[skip][mask[skip]], V_clean[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
+        ax.set_title("Density, t={}".format(round(time, 2)))
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.formatter.set_powerlimits((0, 0))
+        cbar.ax.set_title(r"$\rho$", fontsize=14)
+    else:  # velocity magnitude surface plot
+        pc = ax.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis', vmin=np.min(Vmag), vmax=np.max(Vmag))
+        skip = (slice(None, None, 5), slice(None, None, 5))
+        ax.quiver(
+            tau[skip][mask[skip]], phi[skip][mask[skip]],
+            U_clean[skip][mask[skip]], V_clean[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
+        ax.set_title("Velocity, t={}".format(round(time, 2)))
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.ax.set_title(r" $|v|$", fontsize=14)
+
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    
+    # Add interface lines if using XPINN
+    if use_xpinn:
+        add_interface_lines(ax, xmin, xmax, ymin, ymax)
+    
+    return pc
+
+
+def create_2d_animation(net, initial_params, time_points=None, which="density", fps=2, save_path=None, fixed_colorbar=True, verbose=False):
+    """
+    Create an animated 2D surface plot showing evolution over time
+
+    Args:
+        net: Trained neural network OR list of networks (for XPINN)
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: Array of time points for animation (default: 50 points from 0 to 2.0)
+        which: "density" or "velocity"
+        fps: Frames per second for animation
+        save_path: Optional path to save the animation (e.g., 'animation.mp4')
+    """
+    if time_points is None:
+        # Use the provided training tmax from initial_params to bound animation time
+        _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax = initial_params
+        time_points = np.linspace(0.0, float(tmax), 80)
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    if verbose:
+        print(f"Creating 2D animation with {len(time_points)} frames...")
+    
+    # Create output directory for saving plots: always use config.SNAPSHOT_DIR/GRINN
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create figure and axis
+    fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
+    
+    # Get data for first frame to set up colorbar limits
+    # Use N_GRID for consistency with FD solver resolution
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
+    tau, phi = np.meshgrid(xs, ys)
+    if DIMENSION >= 3:
+        zeta = np.full_like(tau, SLICE_Z)
+    Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+    t_00 = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
+    
+    # Convert to tensors for first frame
+    pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+    pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+    pt_z_collocation = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+    pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+    
+    # Get first frame data to set colorbar limits
+    if use_xpinn:
+        if DIMENSION >= 3:
+            raise NotImplementedError("XPINN animations currently support up to 2D.")
+        output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+    else:
+        # Ensure inputs are on the same device as the model
+        net_device = next(nets[0].parameters()).device
+        pt_x_collocation = pt_x_collocation.to(net_device)
+        pt_t_collocation = pt_t_collocation.to(net_device)
+        if pt_y_collocation is not None:
+            pt_y_collocation = pt_y_collocation.to(net_device)
+        if pt_z_collocation is not None:
+            pt_z_collocation = pt_z_collocation.to(net_device)
+        output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
+    rho_first_tensor, vx_first_tensor, vy_first_tensor, _, _ = _split_outputs(output_00)
+    rho_first = rho_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    U_first = vx_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    if vy_first_tensor is not None:
+        V_first = vy_first_tensor.detach().cpu().numpy().reshape(Q, Q)
+    else:
+        V_first = np.zeros_like(U_first)
+    
+    # (removed temporary quick-check print of mean(U), mean(V))
+    
+    # Optionally precompute fixed color limits using first and last frames
+    fixed_vmin = None
+    fixed_vmax = None
+    if which == "density" and fixed_colorbar:
+        # Use N_GRID for consistency with FD solver resolution
+        # Exclude right boundary for periodic domains to avoid double-counting
+        Q = N_GRID
+        xs = np.linspace(xmin, xmax, Q, endpoint=False)
+        ys = np.linspace(ymin, ymax, Q, endpoint=False)
+        tau, phi = np.meshgrid(xs, ys)
+        Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+        # First frame
+        t_first = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)
+        pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+        pt_t = Variable(torch.from_numpy(t_first).float(), requires_grad=True).to(device)
+        if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN animations currently support up to 2D.")
+            pred_first = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+            rho_first = pred_first[:, 0].data.cpu().numpy().reshape(Q, Q)
+        else:
+            # Ensure inputs are on the same device as the model
+            net_device = next(nets[0].parameters()).device
+            pt_x = pt_x.to(net_device)
+            pt_t = pt_t.to(net_device)
+            if pt_y is not None:
+                pt_y = pt_y.to(net_device)
+            if pt_z is not None:
+                pt_z = pt_z.to(net_device)
+            rho_first = nets[0](_build_input_list(pt_x, pt_t, pt_y, pt_z))[:, 0].data.cpu().numpy().reshape(Q, Q)
+        # Last frame
+        t_last = time_points[-1] * np.ones(Q**2).reshape(Q**2, 1)
+        pt_t_last = Variable(torch.from_numpy(t_last).float(), requires_grad=True).to(device)
+        if use_xpinn:
+            pred_last = predict_xpinn(nets, pt_x, pt_y, pt_t_last, xmin, xmax, ymin, ymax)
+            rho_last = pred_last[:, 0].data.cpu().numpy().reshape(Q, Q)
+        else:
+            # Ensure inputs are on the same device as the model
+            net_device = next(nets[0].parameters()).device
+            pt_t_last = pt_t_last.to(net_device)
+            rho_last = nets[0](_build_input_list(pt_x, pt_t_last, pt_y, pt_z))[:, 0].data.cpu().numpy().reshape(Q, Q)
+        fixed_vmin = min(np.min(rho_first), np.min(rho_last))
+        fixed_vmax = max(np.max(rho_first), np.max(rho_last))
+        if fixed_vmin == fixed_vmax:
+            eps = 1e-6 if fixed_vmin == 0 else 1e-6 * abs(fixed_vmin)
+            fixed_vmin, fixed_vmax = fixed_vmin - eps, fixed_vmax + eps
+
+    # Set up initial plot
+    if which == "density":
+        # Handle flat initial frame by expanding color limits slightly
+        if fixed_colorbar and fixed_vmin is not None:
+            vmin_use, vmax_use = fixed_vmin, fixed_vmax
+        else:
+            rmin, rmax = np.min(rho_first), np.max(rho_first)
+            if not np.isfinite(rmin) or not np.isfinite(rmax):
+                rmin, rmax = 0.0, 1.0
+            if rmin == rmax:
+                eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
+                rmin, rmax = rmin - eps, rmax + eps
+            vmin_use, vmax_use = rmin, rmax
+        pc = ax.pcolormesh(tau, phi, rho_first, shading='auto', cmap='YlOrBr', vmin=vmin_use, vmax=vmax_use)
+        pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+        ax.set_title(f"{pert_str} Density, t={time_points[0]:.2f}")
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.formatter.set_powerlimits((0, 0))
+        cbar.ax.set_title(r"$\rho$", fontsize=14)
+    else:  # velocity magnitude surface plot
+        Vmag_first = np.sqrt(U_first**2 + V_first**2)
+        pc = ax.pcolormesh(tau, phi, Vmag_first, shading='auto', cmap='viridis')
+        pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+        ax.set_title(f"{pert_str} Velocity, t={time_points[0]:.2f}")
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.ax.set_title(r" $|v|$", fontsize=14)
+    
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    
+    # Do not save the initial frame by default; animation frames and optional snapshots cover needs
+    
+    def animate(frame):
+        t = time_points[frame]
+        if verbose:
+            print(f"Animating frame {frame+1}/{len(time_points)} at t={t:.2f}")
+        
+        # Get data for current time
+        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+        
+        # Convert to tensors
+        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(zeta.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+        
+        # Evaluate network(s)
+        if use_xpinn:
+            output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            # Ensure inputs are on the same device as the model
+            net_device = next(nets[0].parameters()).device
+            pt_x_collocation = pt_x_collocation.to(net_device)
+            pt_t_collocation = pt_t_collocation.to(net_device)
+            if pt_y_collocation is not None:
+                pt_y_collocation = pt_y_collocation.to(net_device)
+            if pt_z_collocation is not None:
+                pt_z_collocation = pt_z_collocation.to(net_device)
+            output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
+        
+        rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
+        rho = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+        U = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+        if vy_tensor is not None:
+            V = vy_tensor.detach().cpu().numpy().reshape(Q, Q)
+        else:
+            V = np.zeros_like(U)
+        
+        # Update plot data
+        if which == "density":
+            pc.set_array(rho.ravel())
+            # Update color limits only if not fixed
+            if not fixed_colorbar:
+                rmin, rmax = np.min(rho), np.max(rho)
+                if rmin == rmax:
+                    eps = 1e-6 if rmin == 0 else 1e-6 * abs(rmin)
+                    rmin, rmax = rmin - eps, rmax + eps
+                pc.set_clim(vmin=rmin, vmax=rmax)
+            # Add interface lines if using XPINN
+            if use_xpinn:
+                add_interface_lines(ax, xmin, xmax, ymin, ymax)
+            pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+            ax.set_title(f"{pert_str} Density, t={t:.2f}")
+        else:  # velocity magnitude surface plot
+            Vmag = np.sqrt(U**2 + V**2)
+            pc.set_array(Vmag.ravel())
+            # Add interface lines if using XPINN
+            if use_xpinn:
+                add_interface_lines(ax, xmin, xmax, ymin, ymax)
+            pert_str = "Sinusoidal" if str(PERTURBATION_TYPE).lower() == "sinusoidal" else "Power Spectrum"
+            ax.set_title(f"{pert_str} Velocity, t={t:.2f}")
+        
+        # Save every 10th frame for static snapshots (disabled to avoid extra plots)
+        # if frame % 10 == 0:
+        #     save_path_frame = os.path.join(output_dir, f"{which}_t_{t:.2f}.png")
+        #     plt.savefig(save_path_frame, dpi=300, bbox_inches='tight')
+        #     if verbose:
+        #         print(f"Saved frame to {save_path_frame}")
+        
+        return pc
+    
+    # Create animation
+    anim = animation.FuncAnimation(fig, animate, frames=len(time_points), 
+                                 interval=1000/fps, blit=False, repeat=True)
+    
+    # Save animation with appropriate writer/extension
+    try:
+        if animation.writers.is_available('ffmpeg'):
+            animation_path = os.path.join(output_dir, f"{which}_animation.mp4")
+            if verbose:
+                print(f"Saving animation to {animation_path} with ffmpeg...")
+            anim.save(animation_path, writer='ffmpeg', fps=fps)
+            saved_format = 'mp4'
+        else:
+            animation_path = os.path.join(output_dir, f"{which}_animation.gif")
+            if verbose:
+                print(f"ffmpeg not available. Saving animation to {animation_path} with Pillow...")
+            anim.save(animation_path, writer='pillow', fps=fps)
+            saved_format = 'gif'
+        if verbose:
+            print("Animation saved successfully!")
+    except Exception as e:
+        print(f"Animation save failed: {e}")
+        raise
+    
+    # Optional static snapshots uniformly over [0, tmax]
+    # Static snapshots disabled to prevent extra plots
+    # if SAVE_STATIC_SNAPSHOTS:
+    #     snapshot_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    #     os.makedirs(snapshot_dir, exist_ok=True)
+    #     # Determine tmax from initial_params
+    #     _xmin, _xmax, _ymin, _ymax, _rho_1, _alpha, _lam, _output_folder, tmax_val = initial_params
+    #     times_static = np.linspace(0.0, float(tmax_val), 5)
+    #     if verbose:
+    #         print(f"Saving {len(times_static)} static snapshots to {snapshot_dir} over [0, {tmax_val}]...")
+    #     for t in times_static:
+    #         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+    #         pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+    #         pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device)
+    #         pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+    #         output_00 = net([pt_x_collocation, pt_y_collocation, pt_t_collocation])
+    #         rho = output_00[:, 0].data.cpu().numpy().reshape(Q, Q)
+    #         U = output_00[:, 1].data.cpu().numpy().reshape(Q, Q)
+    #         V = output_00[:, 2].data.cpu().numpy().reshape(Q, Q)
+    #
+    #         fig_static, ax_static = plt.subplots(figsize=(8, 8))
+    #         if which == "density":
+    #             pc_static = ax_static.pcolormesh(tau, phi, rho, shading='auto', cmap='YlOrBr')
+    #             cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+    #             cbar_static.formatter.set_powerlimits((0, 0))
+    #             cbar_static.ax.set_title(r"$\rho$", fontsize=14)
+    #         else:
+    #             Vmag = np.sqrt(U**2 + V**2)
+    #             pc_static = ax_static.pcolormesh(tau, phi, Vmag, shading='auto', cmap='viridis')
+    #             cbar_static = plt.colorbar(pc_static, shrink=0.6, location='right')
+    #             cbar_static.ax.set_title(r" $|v|$", fontsize=14)
+    #         ax_static.set_xlim(xmin, xmax)
+    #         ax_static.set_ylim(ymin, ymax)
+    #         ax_static.set_xlabel("x")
+    #         ax_static.set_ylabel("y")
+    #         plt.tight_layout()
+    #         static_save_path = os.path.join(snapshot_dir, f"{which}_static_t_{t:.2f}.png")
+    #         plt.savefig(static_save_path, dpi=300, bbox_inches='tight')
+    #         plt.close(fig_static)
+    #         if verbose:
+    #             print(f"Saved static snapshot to {static_save_path}")
+    
+    # Generate 5x3 comparison tables for both density and velocity (only once per animation call)
+    if verbose:
+        print("Generating 5x3 comparison tables...")
+    
+    # Only generate comparison tables if this is the density animation call
+    # This prevents duplicate generation when both density and velocity animations are created
+    if which == "density":
+        # Compute cache for 5x3 comparison table time points (5 points uniformly over [0, tmax])
+        comparison_time_points = np.linspace(0.0, float(tmax), 5)
+        print(f"Computing FD cache for 5x3 comparison table ({len(comparison_time_points)} time points)...")
+        fd_cache_5x3 = compute_fd_data_cache(
+            initial_params, comparison_time_points,
+            N=N_GRID, nu=0.5
+        )
+        
+        print("Generating density comparison table...")
+        # Create comparison table for density - use cached data
+        create_5x3_comparison_table(net, initial_params, which="density", N=N_GRID, nu=0.5, fd_cache=fd_cache_5x3)
+        
+        print("Generating velocity comparison table...")
+        # Create comparison table for velocity - use cached data
+        create_5x3_comparison_table(net, initial_params, which="velocity", N=N_GRID, nu=0.5, fd_cache=fd_cache_5x3)
+    
+    # Display animation inline if in a notebook
+    try:
+        from IPython.display import HTML, display
+        import base64
+        with open(animation_path, 'rb') as f:
+            data = f.read()
+        data_base64 = base64.b64encode(data).decode('utf-8')
+        if saved_format == 'mp4':
+            video_html = f'''
+    <div style="text-align: center;">
+        <h3>{which.title()} Evolution Animation</h3>
+        <video width="600" height="600" controls autoplay loop>
+            <source src="data:video/mp4;base64,{data_base64}" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+    '''
+            display(HTML(video_html))
+        else:
+            img_html = f'''
+    <div style="text-align: center;">
+        <h3>{which.title()} Evolution Animation</h3>
+        <img src="data:image/gif;base64,{data_base64}" width="600" height="600" />
+    </div>
+    '''
+            display(HTML(img_html))
+    except Exception as _:
+        pass
+    
+    # Avoid displaying the figure in non-notebook runs
+    plt.close(fig)
+    
+    return anim
+
+
+def create_2d_surface_plots(net, initial_params, time_points=None, which="density"):
+    """
+    Create 2D surface plots at multiple time points
+
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: List of time points to plot (default: [0.0, 0.5, 1.0, 1.5, 2.0])
+        which: "density" or "velocity"
+    """
+    if time_points is None:
+        time_points = [0.0, 0.5, 1.0, 1.5, 2.0]
+    
+    print("Creating 2D surface plots...")
+    
+    # Create subplots for multiple time points
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+
+    for i, t in enumerate(time_points):
+        if i < len(axes):
+            print(f"Plotting at t = {t}")
+            Two_D_surface_plots(net, t, initial_params, ax=axes[i], which=which)
+
+    # Remove the last empty subplot if needed
+    if len(time_points) < len(axes):
+        fig.delaxes(axes[-1])
+
+    plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"2d_surface_plots_{which}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 2D surface plots ({which}) to {save_path}")
+    
+    return fig, axes
+
+
+def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
+    """
+    Create 1D cross section comparison plots between PINN, Linear Theory, and Finite Difference
+    
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_array_1d: List of time points for 1D plots (default: [0.5, 1.0, 1.5])
+    """
+    if time_array_1d is None:
+        time_array_1d = [0.5, 1.0, 1.5]
+    
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    # rho_o imported from config.py
+    num_of_waves = (xmax - xmin) / lam
+    
+    print("Creating 1D cross section comparison plots...")
+    
+    # Create comparison plots
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    axes = axes.flatten()
+
+    # Collect all velocity data to determine appropriate y-axis limits
+    all_velocity_data = []
+    
+    for i, time in enumerate(time_array_1d):
+        print(f"Creating 1D comparison plots at t = {time}")
+        
+        # Get LAX solution (Finite Difference)
+        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
+            "LAX comparison slice (cpu)",
+            lax_solution,
+            time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+        )
+        
+        # Get PINN solution
+        X, rho_pred0, v_pred_x0, v_pred_y0, phi_pred0, rho_max_PN = plot_function(
+            net, [time], initial_params, velocity=True, isplot=False, animation=True
+        )
+        
+        # Interpolate LAX solutions to match PINN grid
+        from scipy.interpolate import interp1d
+        X_flat = X.flatten()
+        
+        # Interpolate Linear Theory and Finite Difference to PINN grid
+        rho_LT_interp = interp1d(x, rho_LT, kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        rho_FD_interp = interp1d(x, rho[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        v_LT_interp = interp1d(x, v_LT, kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        v_FD_interp = interp1d(x, v[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        phi_FD_interp = interp1d(x, phi[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        
+        # Collect velocity data for limit calculation
+        all_velocity_data.append(v_pred_x0)
+        all_velocity_data.append(v_FD_interp)
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            all_velocity_data.append(v_LT_interp)
+        
+        # Density comparison plots
+        axes[i*3].plot(X, rho_pred0, color='c', linewidth=3, label="PINN")
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            axes[i*3].plot(X, rho_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        axes[i*3].plot(X, rho_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[i*3].set_xlim(xmin, xmax)
+        axes[i*3].set_title(f"Density at t={time:.1f}")
+        axes[i*3].set_ylabel(r"$\rho$")
+        axes[i*3].grid(True)
+        axes[i*3].legend()
+        axes[i*3].set_ylim(0.5*rho_o, 1.5*rho_o)
+        
+        # Velocity comparison plots
+        axes[i*3+1].plot(X, v_pred_x0, color='c', linewidth=3, label="PINN")
+        # Only plot Linear Theory when KY == 0 and amplitude is small
+        if (np.isclose(KY, 0.0)) and (a < 0.1):
+            axes[i*3+1].plot(X, v_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        axes[i*3+1].plot(X, v_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[i*3+1].set_xlim(xmin, xmax)
+        axes[i*3+1].set_title(f"Velocity at t={time:.1f}")
+        axes[i*3+1].set_ylabel("$v_x$")
+        axes[i*3+1].grid(True)
+        axes[i*3+1].legend()
+        
+        # Potential comparison plots
+        axes[i*3+2].plot(X, phi_pred0, color='c', linewidth=3, label="PINN")
+        axes[i*3+2].plot(X, phi_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[i*3+2].set_xlim(xmin, xmax)
+        axes[i*3+2].set_title(f"Potential at t={time:.1f}")
+        axes[i*3+2].set_ylabel(r"$\phi$")
+        axes[i*3+2].set_xlabel("x")
+        axes[i*3+2].grid(True)
+        axes[i*3+2].legend()
+
+    # Set velocity y-axis limits based on amplitude (same logic as create_1d_cross_sections_sinusoidal)
+    # Calculate limits from all collected velocity data and apply consistently to all velocity plots
+    if a < 0.1:
+        # Default limits for small amplitude cases
+        v_limu_default = 0.055
+        v_liml_default = -0.055
+    else:
+        # Default limits for large amplitude cases
+        v_limu_default = 0.6
+        v_liml_default = -0.6
+    
+    # Calculate actual data range across all velocity data with padding
+    if all_velocity_data:
+        v_min = np.min([np.min(v_data) for v_data in all_velocity_data])
+        v_max = np.max([np.max(v_data) for v_data in all_velocity_data])
+        v_range = v_max - v_min
+        # Add 10% padding to ensure all data stays within limits
+        padding = max(0.01, 0.1 * v_range)
+        v_liml_actual = v_min - padding
+        v_limu_actual = v_max + padding
+        
+        # Ensure limits are at least as wide as default, but expand if data exceeds them
+        v_liml_actual = min(v_liml_actual, v_liml_default)
+        v_limu_actual = max(v_limu_actual, v_limu_default)
+    else:
+        v_liml_actual = v_liml_default
+        v_limu_actual = v_limu_default
+    
+    # Apply consistent limits to all velocity plots
+    for i in range(len(time_array_1d)):
+        axes[i*3+1].set_ylim(v_liml_actual, v_limu_actual)
+
+    plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "1d_comparison_plots.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 1D comparison plots to {save_path}")
+    
+    plt.show()
+
+
+def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
+    """
+    Create growth comparison plot showing density maximum evolution over time
+    
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_array_growth: Array of time points for growth analysis (default: 10 points from 0.1 to tmax)
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    # rho_o imported from config.py
+    num_of_waves = (xmax - xmin) / lam
+    
+    if time_array_growth is None:
+        time_array_growth = np.linspace(0.1, tmax, 5)  # Reduced from 10 to 5 points
+    
+    print("Creating growth comparison plot...")
+    
+    Growth_LT_list = []
+    Growth_FD_list = []
+    Growth_PN_list = []
+
+    for i, time in enumerate(time_array_growth):
+        print(f"Processing growth point {i+1}/{len(time_array_growth)} at t={time:.2f}")
+        # Get LAX solution with configured grid resolution
+        x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
+            "LAX comparison slice (cpu)",
+            lax_solution,
+            time, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+        )
+        
+        # Get PINN solution
+        X, rho_pred0, v_pred_x0, v_pred_y0, phi_pred0, rho_max_PN = plot_function(
+            net, [time], initial_params, velocity=True, isplot=False, animation=True
+        )
+        
+        Growth_LT = rho_LT_max - rho_o
+        Growth_FD = rho_max_FD - rho_o  
+        Growth_PN = rho_max_PN - rho_o
+        
+        Growth_LT_list.append(Growth_LT)
+        Growth_FD_list.append(Growth_FD)
+        Growth_PN_list.append(Growth_PN)
+
+    # Plot growth comparison
+    plt.figure(figsize=(8, 6))
+    # Only plot Linear Theory when KY == 0 and amplitude is small
+    if (np.isclose(KY, 0.0)) and (a < 0.1):
+        plt.plot(time_array_growth, np.log(Growth_LT_list), marker='o', color='b', linewidth=2, label="Linear Theory")
+    plt.plot(time_array_growth, np.log(Growth_FD_list), '--', marker='*', color='k', linewidth=3, label="Finite Difference")
+    plt.plot(time_array_growth, np.log(Growth_PN_list), marker='^', markersize=8, linewidth=2, color='r', label="PINN")
+    plt.xlabel("t", fontsize=14)
+    plt.ylabel(r"$\log (\rho_{\rm max} - \rho_{0})$", fontsize=14)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    plt.title("Growth Comparison: PINN vs Linear Theory vs Finite Difference")
+    plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "growth_comparison_plot.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved growth comparison plot to {save_path}")
+    
+    plt.show()
+
+
+def compute_fd_data_cache(initial_params, time_points, N=200, nu=0.5,
+                          use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None):
+    """
+    Compute and cache FD solver data for all time points to avoid redundant solver calls.
+    
+    Args:
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: List of time points to compute
+        N: Grid resolution for LAX solver
+        nu: Courant number for LAX solver
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config)
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT)
+        vel_rms: Velocity RMS amplitude (defaults to a*cs)
+        random_seed: Random seed (defaults to RANDOM_SEED)
+    
+    Returns:
+        Dictionary mapping time -> FD data: {time: {'x': x_fd, 'y': y_fd, 'z': z_fd (if 3D),
+                                                    'rho': rho_fd, 'vx': vx_fd, 'vy': vy_fd, 'phi': phi_fd}}
+    """
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
+    
+    # Use config defaults if not specified
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    num_of_waves = (xmax - xmin) / lam
+    
+    # Decide grid resolution policy
+    if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+        N_use = N_GRID
+    else:
+        N_use = FD_N_2D if N is None else N
+    
+    # Convert time_points to numpy array and sort
+    time_points = np.array(time_points)
+    time_points = np.sort(np.unique(time_points))
+    max_time = float(np.max(time_points))
+    
+    print(f"Computing FD data cache for {len(time_points)} time points (optimized: single run to t={max_time:.2f})...")
+    fd_cache = {}
+    
+    # OPTIMIZED: Run solver once to max_time with snapshots at all time points
+    if DIMENSION == 3:
+        # Use unified solver with snapshot support
+        results_dict = _call_unified_3d_solver(
+            time=max_time, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
+            use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+            vel_rms=vel_rms, random_seed=random_seed,
+            save_times=time_points.tolist()
+        )
+        
+        # Process each snapshot
+        for t in time_points:
+            if t not in results_dict:
+                print(f"  Warning: snapshot at t={t:.2f} not found, skipping...")
+                continue
+            
+            print(f"  Processing snapshot at t = {t:.2f}")
+            result = results_dict[t]
+            
+            # Extract results from unified solver
+            x_fd = result.coordinates['x']
+            y_fd = result.coordinates['y']
+            z_fd = result.coordinates['z']
+            rho_vol = result.density
+            vx_vol, vy_vol, vz_vol = result.velocity_components
+            phi_vol = result.potential
+            
+            # Adaptive z-slice selection based on perturbation type
+            if str(PERTURBATION_TYPE).lower() == 'power_spectrum':
+                # ADAPTIVE Z-SELECTION: Choose slice with most structure
+                z_idx, z_val, contrast = find_max_contrast_slice(rho_vol, z_fd)
+                print(f"  📊 Auto-selected z={z_val:.3f} (contrast={contrast:.2e})")
+                
+                # Optional: Save diagnostic plot first time
+                if t == time_points[0]:  # Only for first timepoint
+                    analyze_z_variation(rho_vol, z_fd, t, save_dir=SNAPSHOT_DIR)
+            else:  # sinusoidal
+                # FIXED Z-SELECTION: Use config value for sinusoidal
+                z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+                z_val = z_fd[z_idx]
+                print(f"  Using fixed z={z_val:.3f} (sinusoidal)")
+            
+            # Extract 2D slices
+            rho_fd = rho_vol[:, :, z_idx]
+            vx_fd = vx_vol[:, :, z_idx]
+            vy_fd = vy_vol[:, :, z_idx]
+            phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+            
+            # Store selected z for later use
+            fd_cache[t] = {
+                'x': x_fd,
+                'y': y_fd,
+                'z': z_fd,
+                'rho': rho_fd,
+                'vx': vx_fd,
+                'vy': vy_fd,
+                'phi': phi_fd,
+                'z_idx': z_idx,     # Store index
+                'z_val': z_val,     # Store value
+                'rho_vol': rho_vol,  # Keep volume for reference (optional)
+                'vx_vol': vx_vol,
+                'vy_vol': vy_vol,
+                'phi_vol': phi_vol,
+            }
+    else:
+        # 2D case - use optimized single-run approach
+        # Set up domain and physics parameters for unified solver
+        Lx = Ly = lam * num_of_waves
+        domain_params = {'Lx': Lx, 'Ly': Ly, 'nx': N_use, 'ny': N_use}
+        physics_params = {
+            'c_s': cs,
+            'rho_o': rho_o,
+            'const': const,
+            'G': G,
+            'rho_1': rho_1,
+            'lam': lam
+        }
+        options = {'gravity': True, 'nu': nu, 'comparison': False, 'isplot': False}
+        
+        # Set up IC parameters
+        if use_velocity_ps:
+            ic_type = 'power_spectrum'
+            ic_params = {
+                'power_index': ps_index,
+                'amplitude': vel_rms,
+                'random_seed': random_seed,
+                'vx0_shared': _shared_vx_np,
+                'vy0_shared': _shared_vy_np
+            }
+        else:
+            ic_type = 'sinusoidal'
+            ic_params = {'KX': KX, 'KY': KY}
+        
+        # Run solver once with snapshots
+        if torch.cuda.is_available() or (use_velocity_ps and _shared_vx_np is None):
+            # Use torch solver (supports save_times)
+            _clear_cuda_cache()
+            results_dict = _timed_call(
+                "LAX 2D (optimized torch)",
+                lax_solver_torch,
+                time=max_time, domain_params=domain_params,
+                physics_params=physics_params,
+                ic_type=ic_type, ic_params=ic_params,
+                options=options, save_times=time_points.tolist()
+            )
+        else:
+            # Fallback: use old approach for shared-field CPU case
+            # (lax_solution doesn't support save_times yet)
+            results_dict = {}
+            for t in time_points:
+                print(f"  Computing FD data at t = {t:.2f}")
+                n_fd_use = int(_shared_vx_np.shape[0])
+                x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 2D (shared-field cpu)",
+                    lax_solution,
+                    t, n_fd_use, nu, lam, num_of_waves, rho_1,
+                    gravity=True, isplot=False, comparison=False, animation=True,
+                    vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
+                )
+                Lx = lam * num_of_waves
+                Nx = x_fd.shape[0]
+                Ny = rho_fd.shape[1]
+                y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
+                # Create a simple result object
+                class SimpleResult:
+                    def __init__(self):
+                        self.coordinates = {'x': x_fd, 'y': y_fd}
+                        self.density = rho_fd
+                        self.velocity_components = [vx_fd, vy_fd]
+                        self.potential = phi_fd
+                results_dict[t] = SimpleResult()
+        
+        # Process each snapshot for 2D
+        for t in time_points:
+            if t not in results_dict:
+                print(f"  Warning: snapshot at t={t:.2f} not found, skipping...")
+                continue
+            
+            print(f"  Processing snapshot at t = {t:.2f}")
+            result = results_dict[t]
+            
+            x_fd = result.coordinates['x']
+            y_fd = result.coordinates['y']
+            rho_fd = result.density
+            vx_fd, vy_fd = result.velocity_components
+            phi_fd = result.potential if hasattr(result, 'potential') and result.potential is not None else np.zeros_like(rho_fd)
+            
+            fd_cache[t] = {
+                'x': x_fd,
+                'y': y_fd,
+                'rho': rho_fd,
+                'vx': vx_fd,
+                'vy': vy_fd,
+                'phi': phi_fd
+            }
+    
+    print(f"FD data cache computed for {len(fd_cache)} time points.")
+    return fd_cache
+
+
+def create_all_plots(net, initial_params, include_growth=False,
+                     fd_use_velocity_ps=None, fd_ps_index=None, fd_vel_rms=None, fd_random_seed=None):
+    """
+    Create only 2D surface plot grids (density and velocity). Optionally create FD grids and return figures.
+    Uses cached FD data to avoid redundant solver calls.
+
+    Args:
+        net: Trained neural network
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        include_growth: Unused now; kept for API compatibility.
+        fd_use_velocity_ps: Override for FD velocity power spectrum flag (defaults to config)
+        fd_ps_index: Override for FD power spectrum index (defaults to POWER_EXPONENT)
+        fd_vel_rms: Override for FD velocity RMS (defaults to a*cs)
+        fd_random_seed: Override for FD random seed (defaults to 1234)
+    Returns:
+        dict with figures/axes: {"pinn_density": (fig, axes), "pinn_velocity": (fig, axes),
+                                 "fd_density": (fig, axes), "fd_velocity": (fig, axes)}
+    """
+    print("="*60)
+    print("CREATING GRID VISUALIZATION PLOTS")
+    print("="*60)
+    
+    # Use config defaults if not overridden to ensure consistency with PINN training
+    if fd_use_velocity_ps is None:
+        fd_use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if fd_ps_index is None:
+        fd_ps_index = POWER_EXPONENT
+    if fd_vel_rms is None:
+        fd_vel_rms = a * cs
+    if fd_random_seed is None:
+        fd_random_seed = RANDOM_SEED
+
+    # Default time points for 2D surface plots
+    time_points_2d = [0.0, 0.5, 1.0, 1.5, 2.0]
+    
+    # Get time points for 1D cross-sections (if used)
+    time_points_1d = TIMES_1D if isinstance(TIMES_1D, (list, tuple)) and len(TIMES_1D) > 0 else [0.5, 1.0, 1.5]
+    
+    # Combine all time points and remove duplicates
+    all_time_points = sorted(list(set(time_points_2d + time_points_1d)))
+    
+    # Compute FD data cache once for all plots (2D and 1D)
+    print(f"Computing FD cache for {len(all_time_points)} unique time points...")
+    fd_cache = compute_fd_data_cache(
+        initial_params, all_time_points,
+        use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
+        vel_rms=fd_vel_rms, random_seed=fd_random_seed
+    )
+
+    # 1. PINN density grid
+    fig_den, axes_den = create_2d_surface_plots(net, initial_params, which="density")
+
+    # 2. PINN velocity grid
+    fig_vel, axes_vel = create_2d_surface_plots(net, initial_params, which="velocity")
+
+    # 3. FD density grid - uses cached data
+    fig_fd_den, axes_fd_den = create_2d_surface_plots_FD(initial_params, which="density",
+                                                         use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
+                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed,
+                                                         fd_cache=fd_cache)
+
+    # 4. FD velocity grid - uses cached data
+    fig_fd_vel, axes_fd_vel = create_2d_surface_plots_FD(initial_params, which="velocity",
+                                                         use_velocity_ps=fd_use_velocity_ps, ps_index=fd_ps_index,
+                                                         vel_rms=fd_vel_rms, random_seed=fd_random_seed,
+                                                         fd_cache=fd_cache)
+
+    print("="*60)
+    print("ALL GRID PLOTS COMPLETED!")
+    print("="*60)
+
+    # Display all created figures so they appear when called from train.py
+    plt.show()
+
+    result = {
+        "pinn_density": (fig_den, axes_den),
+        "pinn_velocity": (fig_vel, axes_vel),
+        "fd_density": (fig_fd_den, axes_fd_den),
+        "fd_velocity": (fig_fd_vel, axes_fd_vel),
+        "fd_cache": fd_cache,  # Return cache for reuse in other plotting functions
+    }
+    
+    return result
+
+
+def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
+    """
+    Create a PINN vs LAX density growth comparison plot.
+
+    Plots over time: (1) maximum density, (2) log(rho_max - rho_o + eps).
+
+    Args:
+        net: trained PINN model
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax_train)
+        tmax: maximum time to plot (independent of training tmax)
+        dt: temporal spacing (default 0.1)
+    """
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax_train = initial_params
+    
+    # Handle both single network and list of networks (XPINN)
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    num_of_waves = (xmax - xmin) / lam
+
+    # Time grid (inclusive of tmax)
+    time_points = np.arange(0.0, float(tmax) + 1e-9, float(dt))
+
+    # Pre-compute FD cache for all time points to avoid redundant solver calls
+    # This dramatically speeds up the plot generation, especially for 3D
+    print(f"Pre-computing FD data cache for {len(time_points)} time points (this may take a moment)...")
+    fd_cache = compute_fd_data_cache(
+        initial_params, time_points, N=None, nu=0.5,
+        use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None
+    )
+    print("FD cache computed. Generating density growth plot...")
+
+    pinn_max_list = []
+    fd_max_list = []
+
+    # PINN grid sampling settings (use N_GRID for consistency with FD solver)
+    # Exclude right boundary for periodic domains to avoid double-counting
+    Q = N_GRID
+    xs = np.linspace(xmin, xmax, Q, endpoint=False)
+    ys = np.linspace(ymin, ymax, Q, endpoint=False)
+    TAU, PHI = np.meshgrid(xs, ys)
+    if DIMENSION >= 3:
+        ZETA = np.full_like(TAU, SLICE_Z)
+    Xgrid = np.vstack([TAU.flatten(), PHI.flatten()]).T
+
+    for idx, t in enumerate(time_points):
+        # PINN evaluation on QxQ grid
+        t_vec = t * np.ones(Q**2).reshape(Q**2, 1)
+        pt_x = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z = Variable(torch.from_numpy(ZETA.reshape(-1, 1)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+        pt_t = Variable(torch.from_numpy(t_vec).float(), requires_grad=True).to(device)
+        if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN density-growth visualization not supported for DIMENSION=3.")
+            out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+        else:
+            out = nets[0](_build_input_list(pt_x, pt_t, pt_y, pt_z))
+        rho_tensor, *_ = _split_outputs(out)
+        rho_pinn = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+        pinn_max_list.append(np.max(rho_pinn))
+
+        # LAX/FD evaluation using cached data
+        if DIMENSION == 3:
+            # Use cached FD data
+            if t in fd_cache:
+                cache_data = fd_cache[t]
+                rho_fd = cache_data['rho']
+                fd_max_list.append(np.max(rho_fd))
+            else:
+                # Fallback: compute on the fly if cache miss (shouldn't happen)
+                use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                result = _call_unified_3d_solver(
+                    time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=0.5,
+                    use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                    vel_rms=a*cs, random_seed=RANDOM_SEED
+                )
+                rho_fd = result.density
+                z_grid = result.coordinates['z']
+                z_idx = np.argmin(np.abs(z_grid - SLICE_Z))
+                fd_max_list.append(np.max(rho_fd[:, :, z_idx]))
+        else:
+            # Use cached FD data for 2D
+            if t in fd_cache:
+                cache_data = fd_cache[t]
+                rho_fd = cache_data['rho']
+                fd_max_list.append(np.max(rho_fd))
+            else:
+                # Fallback: compute on the fly if cache miss (shouldn't happen)
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                    if idx == 0:
+                        print(f"Using GPU solver for density growth plot (CUDA available)")
+                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                        "LAX 2D (torch)",
+                        lax_solution_torch,
+                        time_val=t, N=N_GRID, nu=0.5, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT, 
+                        vel_rms=a*cs, random_seed=RANDOM_SEED
+                    )
+                else:
+                    if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                        if _shared_vx_np is not None and _shared_vy_np is not None:
+                            n_fd_use = int(_shared_vx_np.shape[0])
+                            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                                "LAX 2D (shared-field cpu)",
+                                lax_solution,
+                                t, n_fd_use, 0.5, lam, num_of_waves, rho_1,
+                                gravity=True, isplot=False, comparison=False, animation=True,
+                                vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
+                            )
+                        else:
+                            x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                                "LAX 2D (power cpu)",
+                                lax_solution,
+                                t, N_GRID, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            )
+                    else:
+                        x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (sinusoidal cpu)",
+                            lax_solution,
+                            t, FD_N_2D, 0.5, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                            use_velocity_ps=False
+                        )
+                fd_max_list.append(np.max(rho_fd))
+
+    # Build figure with two subplots
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # (1) Max density vs time
+    axes[0].plot(time_points, fd_max_list, label="LAX", color='k', linewidth=2)
+    axes[0].plot(time_points, pinn_max_list, label="PINN", color='c', linewidth=2)
+    axes[0].set_xlabel("t")
+    axes[0].set_ylabel(r"$\rho_{\max}$")
+    axes[0].set_title("Maximum Density vs Time")
+    axes[0].grid(True)
+    axes[0].legend()
+    # Annotate parameters on the plot
+    try:
+        param_str = f"a={a}, power_index={POWER_EXPONENT}"
+        axes[0].text(0.02, 0.95, param_str, transform=axes[0].transAxes,
+                     fontsize=9, va='top', bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='gray', alpha=0.6))
+    except Exception:
+        pass
+
+    # (2) log growth vs time
+    eps = 1e-12
+    axes[1].plot(time_points, np.log(np.maximum(np.array(fd_max_list) - rho_o, 0.0) + eps), label="LAX", color='k', linewidth=2)
+    axes[1].plot(time_points, np.log(np.maximum(np.array(pinn_max_list) - rho_o, 0.0) + eps), label="PINN", color='c', linewidth=2)
+    axes[1].set_xlabel("t")
+    axes[1].set_ylabel(r"$\log(\rho_{\max} - \rho_0)$")
+    axes[1].set_title("Density Growth (log)")
+    axes[1].grid(True)
+    axes[1].legend()
+    # Mirror annotation on second axis
+    try:
+        param_str = f"a={a}, power_index={POWER_EXPONENT}"
+        axes[1].text(0.02, 0.95, param_str, transform=axes[1].transAxes,
+                     fontsize=9, va='top', bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='gray', alpha=0.6))
+    except Exception:
+        pass
+
+    plt.tight_layout()
+
+    # Save figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "density_growth_comparison.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved density growth comparison plot to {save_path}")
+
+    plt.show()
+
+    return fig, axes
+
+
+def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y_fixed=0.6, N_fd=1000, nu_fd=0.5,
+                                        fd_cache=None):
+    """
+    Create 1D cross-section plots at fixed y for sinusoidal perturbations, comparing
+    PINN vs Linear Theory vs 1D LAX (sinusoidal).
+
+    Args:
+        net: trained network
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: list of times to plot
+        y_fixed: y value for the 1D slice through the 2D domain
+        N_fd: grid size for 1D LAX solver (only used if fd_cache is None)
+        nu_fd: Courant number for 1D LAX solver (only used if fd_cache is None)
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, _output_folder, _tmax = initial_params
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    num_of_waves = (xmax - xmin) / lam
+
+    if time_points is None:
+        time_points = TIMES_1D if isinstance(TIMES_1D, (list, tuple)) and len(TIMES_1D) > 0 else [0.5, 1.0, 1.5]
+
+    # Use baseline density 1.0 for Linear Theory reference
+    rho_base = 1.0
+    jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_base))
+    k = np.sqrt(KX**2 + KY**2 + KZ**2)
+    v1_lt = (rho_1 / rho_base) * (alpha / k) if k > 1e-12 else 0.0
+
+    # Build x grid for PINN slice
+    X = np.linspace(xmin, xmax, 1000).reshape(1000, 1)
+    Y = y_fixed * np.ones_like(X)
+    z_fixed = SLICE_Z if DIMENSION >= 3 else None
+    if DIMENSION >= 3:
+        Z = z_fixed * np.ones_like(X)
+    else:
+        Z = None
+
+    # Create 2 rows x T columns panel layout matching target style
+    T = len(time_points)
+    fig = plt.figure(figsize=(6*T, 8), constrained_layout=False)
+    grid = plt.GridSpec(4, T, figure=fig, hspace=0.12, wspace=0.18)
+
+    for row_idx, t in enumerate(time_points):
+        # PINN predictions at fixed y (and z for 3D)
+        t_arr = t * np.ones_like(X)
+        pt_x = Variable(torch.from_numpy(X).float(), requires_grad=True).to(device)
+        pt_y = Variable(torch.from_numpy(Y).float(), requires_grad=True).to(device)
+        pt_z = Variable(torch.from_numpy(Z).float(), requires_grad=True).to(device) if Z is not None else None
+        pt_t = Variable(torch.from_numpy(t_arr).float(), requires_grad=True).to(device)
+        if use_xpinn:
+            if DIMENSION >= 3:
+                raise NotImplementedError("XPINN visualizations currently support up to 2D.")
+            out = predict_xpinn(nets, pt_x, pt_y, pt_t, xmin, xmax, ymin, ymax)
+        else:
+            # Use _build_input_list helper to ensure correct coordinate ordering
+            inputs = _build_input_list(pt_x, pt_t, pt_y, pt_z)
+            out = nets[0](inputs)
+        rho_pinn = out[:, 0:1].data.cpu().numpy().reshape(-1)
+        vx_pinn = out[:, 1:2].data.cpu().numpy().reshape(-1)
+        # potential not used in cross-section plots
+
+        show_lt = np.isclose(KY, 0.0) and np.isclose(KZ, 0.0) and (a < 0.1)
+        if show_lt:
+            phase = KX * X[:, 0] + KY * y_fixed + (KZ * z_fixed if z_fixed is not None else 0.0)
+            if lam >= jeans:
+                rho_lt = rho_base + rho_1*np.exp(alpha * t)*np.cos(phase)
+                if k > 0:
+                    vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(phase) * (KX / k)
+                else:
+                    vx_lt = -v1_lt*np.exp(alpha * t)*np.sin(phase)
+            else:
+                omega = np.sqrt(cs**2 * (KX**2 + KY**2 + KZ**2) - const*G*rho_base)
+                rho_lt = rho_base + rho_1*np.cos(omega * t - phase)
+                if k > 0:
+                    vx_lt = v1_lt*np.cos(omega * t - phase) * (KX / k)
+                else:
+                    vx_lt = v1_lt*np.cos(omega * t - phase)
+
+        from scipy.interpolate import interp1d
+        
+        # Use cached data if available
+        if fd_cache is not None and t in fd_cache:
+            cache_data = fd_cache[t]
+            if DIMENSION == 3:
+                # For 3D, use the volume data from cache
+                if 'rho_vol' in cache_data:
+                    rho_fd_3d = cache_data['rho_vol']
+                    vx_fd_3d = cache_data['vx_vol']
+                    phi_fd_3d = cache_data['phi_vol']
+                    y_fd = cache_data['y']
+                    z_fd = cache_data['z']
+                    z_idx = cache_data.get('z_idx', np.argmin(np.abs(z_fd - SLICE_Z)))
+                else:
+                    # Fallback to 2D slice if volume not cached
+                    rho_fd_3d = cache_data['rho'][:, :, np.newaxis]
+                    vx_fd_3d = cache_data['vx'][:, :, np.newaxis]
+                    phi_fd_3d = cache_data['phi'][:, :, np.newaxis] if cache_data['phi'] is not None else None
+                    y_fd = cache_data['y']
+                    z_fd = np.array([SLICE_Z])
+                    z_idx = 0
+                y_idx = np.argmin(np.abs(y_fd - y_fixed))
+                rho_fd = rho_fd_3d[:, y_idx, z_idx]
+                v_fd = vx_fd_3d[:, y_idx, z_idx]
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx] if phi_fd_3d is not None else None
+                x_fd_line = cache_data['x']
+            else:
+                x_fd_2d = cache_data['x']
+                y_fd_2d = cache_data['y']
+                rho_fd_2d = cache_data['rho']
+                vx_fd_2d = cache_data['vx']
+                _phi_fd_2d = cache_data['phi'] if cache_data['phi'] is not None else np.zeros_like(rho_fd_2d)
+                y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+                rho_fd = rho_fd_2d[:, y_idx]
+                v_fd = vx_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                x_fd_line = x_fd_2d
+        else:
+            # Compute FD data if not cached
+            if DIMENSION == 3:
+                # Use unified solver with proper IC type support
+                use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                result = _call_unified_3d_solver(
+                    time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu_fd,
+                    use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                    vel_rms=a*cs, random_seed=RANDOM_SEED
+                )
+                # Extract results from unified solver
+                x_fd = result.coordinates['x']
+                y_fd = result.coordinates['y']
+                z_fd = result.coordinates['z']
+                rho_fd_3d = result.density
+                vx_fd_3d, vy_fd_3d, vz_fd_3d = result.velocity_components
+                phi_fd_3d = result.potential
+                y_idx = np.argmin(np.abs(y_fd - y_fixed))
+                z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+                rho_fd = rho_fd_3d[:, y_idx, z_idx]
+                v_fd = vx_fd_3d[:, y_idx, z_idx]
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx]
+                x_fd_line = x_fd
+            else:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    if row_idx == 0:
+                        print(f"Using GPU solver for 1D cross section plot (CUDA available)")
+                    use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+                    x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, phi_fd_2d_torch, _n, _rho_max = _timed_call(
+                        "LAX 2D slice (torch)",
+                        lax_solution_torch,
+                        time_val=t, N=FD_N_2D, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
+                        vel_rms=a*cs, random_seed=RANDOM_SEED
+                    )
+                    # Handle case where torch version returns None for phi (compute dummy phi if needed)
+                    if phi_fd_2d_torch is None:
+                        _phi_fd_2d = np.zeros_like(rho_fd_2d)
+                    else:
+                        _phi_fd_2d = phi_fd_2d_torch
+                else:
+                    x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = _timed_call(
+                        "LAX 2D slice (cpu)",
+                        lax_solution,
+                        t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True
+                    )
+                y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
+                y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
+                rho_fd = rho_fd_2d[:, y_idx]
+                v_fd = vx_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                x_fd_line = x_fd_2d
+
+        rho_fd_interp = interp1d(x_fd_line, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        v_fd_interp = interp1d(x_fd_line, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+        phi_fd_interp = interp1d(x_fd_line, phi_fd_slice, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
+
+        # Column index
+        c = row_idx
+        # Top row: density
+        ax_rho = fig.add_subplot(grid[0, c])
+        ax_rho.plot(X[:, 0], rho_pinn, label="GRINN", color='c', linewidth=2)
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and show_lt:
+            ax_rho.plot(X[:, 0], rho_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_rho.plot(X[:, 0], rho_fd_interp, label="FD", color='k', linewidth=1)
+        ax_rho.set_title(f"t={t:.1f}")
+        ax_rho.set_ylabel(r"$\rho$")
+        ax_rho.grid(True)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all density values that are plotted
+        rho_all = [rho_pinn, rho_fd_interp]
+        if SHOW_LINEAR_THEORY and show_lt:
+            rho_all.append(rho_lt)
+        rho_min = min(np.min(rho) for rho in rho_all)
+        rho_max = max(np.max(rho) for rho in rho_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        rho_range = rho_max - rho_min
+        padding = max(0.1 * rho_range, 0.05)  # At least 0.05 units of padding
+        liml = rho_min - padding
+        limu = rho_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 1.2*rho_o
+        #     liml = .8*rho_o
+        # else:
+        #     limu = 3.0*rho_o
+        #     liml = -1.0*rho_o
+        ax_rho.set_ylim(liml, limu)
+        if c == 0:
+            ax_rho.legend(loc='upper right', fontsize=8)
+
+        # Second row: epsilon for density using symmetric percent with absolute numerator
+        # ε = 200 * |G - R| / (G + R) with more robust denominator
+        eps_rho = 200.0 * np.abs(rho_pinn - rho_fd_interp) / (rho_pinn + rho_fd_interp + 1e-6)
+        ax_eps_rho = fig.add_subplot(grid[1, c])
+        ax_eps_rho.plot(X[:, 0], eps_rho, color='k', linewidth=1, label='FD')
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and show_lt:
+            eps_rho_lt = 200.0 * np.abs(rho_pinn - rho_lt) / (rho_pinn + rho_lt + 1e-6)
+            ax_eps_rho.plot(X[:, 0], eps_rho_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_rho.set_ylabel(r"$\varepsilon$")
+        ax_eps_rho.grid(True)
+        if c == 0:
+            ax_eps_rho.legend(loc='upper right', fontsize=8)
+
+        # Third row: velocity
+        ax_v = fig.add_subplot(grid[2, c])
+        ax_v.plot(X[:, 0], vx_pinn, label="GRINN", color='c', linewidth=2)
+        # Only plot Linear Theory when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and show_lt:
+            ax_v.plot(X[:, 0], vx_lt, label="LT", linestyle='--', color='firebrick', linewidth=1.5)
+        ax_v.plot(X[:, 0], v_fd_interp, label="FD", color='k', linewidth=1)
+        ax_v.set_ylabel(r"$v$")
+        ax_v.grid(True)
+        # Dynamic y-axis limits based on actual data with padding (similar to t=3.0 plot)
+        # Collect all velocity values that are plotted
+        v_all = [vx_pinn, v_fd_interp]
+        if SHOW_LINEAR_THEORY and show_lt:
+            v_all.append(vx_lt)
+        v_min = min(np.min(v) for v in v_all)
+        v_max = max(np.max(v) for v in v_all)
+        # Add padding: ~10% of the data range on each side (similar to t=3.0 example)
+        v_range = v_max - v_min
+        padding = max(0.1 * v_range, 0.005)  # At least 0.005 units of padding
+        liml = v_min - padding
+        limu = v_max + padding
+        # Commented out hardcoded limits:
+        # if a < 0.1:
+        #     limu = 0.055
+        #     liml = -0.055
+        # else:
+        #     limu = 0.6
+        #     liml = -0.6
+        ax_v.set_ylim(liml, limu)
+        if c == 0:
+            ax_v.legend(loc='upper right', fontsize=8)
+
+        # Fourth row: epsilon for velocity using notebook-style +1 offset (symmetric percent with shift)
+        # ε = 200 * |(v_pred+1) - (v_ref+1)| / ((v_pred+1) + (v_ref+1)) = 200 * |v_pred - v_ref| / (v_pred + v_ref + 2)
+        v_ref = v_fd_interp
+        v_pred = vx_pinn
+        eps_v = 200.0 * np.abs(v_pred - v_ref) / (v_pred + v_ref + 2.0)
+        ax_eps_v = fig.add_subplot(grid[3, c])
+        ax_eps_v.plot(X[:, 0], eps_v, color='k', linewidth=1, label='FD')
+        # Only plot Linear Theory epsilon when enabled in config, KY == 0, and amplitude is small
+        if SHOW_LINEAR_THEORY and show_lt:
+            eps_v_lt = 200.0 * np.abs(v_pred - vx_lt) / (v_pred + vx_lt + 2.0)
+            ax_eps_v.plot(X[:, 0], eps_v_lt, color='firebrick', linestyle='--', linewidth=1, label='LT')
+        ax_eps_v.set_xlabel("x")
+        ax_eps_v.set_ylabel(r"$\varepsilon$")
+        ax_eps_v.grid(True)
+        if c == 0:
+            ax_eps_v.legend(loc='upper right', fontsize=8)
+
+        # No potential subplot per request
+
+    # Reduce outer margins similar to notebook style
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.92, bottom=0.10, wspace=0.18, hspace=0.12)
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, "1d_cross_sections_sinusoidal.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 1D cross sections plot to {save_path}")
+    
+    plt.show()
+
+    return fig
+
+
+def Two_D_surface_plots_FD(time, initial_params, N=200, nu=0.5, ax=None, which="density",
+                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                           fd_cache=None):
+    """
+    Create 2D surface plots with velocity vectors using the Finite Difference (LAX) solver
+
+    Args:
+        time: Time to plot
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        N: Grid resolution for LAX solver (Nx = Ny = N) - only used if fd_cache is None
+        nu: Courant number for LAX solver - only used if fd_cache is None
+        ax: Optional matplotlib axis to plot on
+        which: "density" or "velocity"
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS amplitude (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
+
+    Returns:
+        The QuadMesh object from pcolormesh
+    """
+    xmin, xmax, ymin, ymax, rho_1, _alpha, lam, _output_folder, _tmax = initial_params
+
+    # Use cached data if available
+    if fd_cache is not None and time in fd_cache:
+        cache_data = fd_cache[time]
+        x_fd = cache_data['x']
+        y_fd = cache_data['y']
+        rho_fd = cache_data['rho']
+        vx_fd = cache_data['vx']
+        vy_fd = cache_data['vy']
+        X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+        Nx = x_fd.shape[0]
+        Ny = y_fd.shape[0] if len(y_fd.shape) > 0 else rho_fd.shape[1]
+    else:
+        # Use config defaults if not specified to ensure consistency with PINN training
+        if use_velocity_ps is None:
+            use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+        if ps_index is None:
+            ps_index = POWER_EXPONENT
+        if vel_rms is None:
+            vel_rms = a * cs
+        if random_seed is None:
+            random_seed = RANDOM_SEED
+
+        # Domain properties for LAX (Lx = Ly and Nx = Ny in solver)
+        num_of_waves = (xmax - xmin) / lam
+
+        # Decide grid resolution policy: use N_GRID for power spectrum; FD_N_2D for sinusoidal when N is None
+        if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+            N_use = N_GRID
+        else:
+            N_use = FD_N_2D if N is None else N
+
+        # Run LAX solver (finite difference) with self-gravity enabled to obtain 2D fields
+        # Prefer using the exact shared velocity fields (if available) to ensure identical realization
+        # across PINN ICs and all FD visualizations.
+        # Returns (gravity=True, comparison=False, animation=True):
+        #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
+        if DIMENSION == 3:
+            # Use unified solver with proper IC type support
+            result = _call_unified_3d_solver(
+                time=time, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
+                use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+                vel_rms=vel_rms, random_seed=random_seed
+            )
+            # Extract results from unified solver
+            x_fd = result.coordinates['x']
+            y_fd = result.coordinates['y']
+            z_fd = result.coordinates['z']
+            rho_vol = result.density
+            vx_vol, vy_vol, vz_vol = result.velocity_components
+            z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+            rho_fd = rho_vol[:, :, z_idx]
+            vx_fd = vx_vol[:, :, z_idx]
+            vy_fd = vy_vol[:, :, z_idx]
+            X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+        else:
+            if (str(PERTURBATION_TYPE).lower() == "power_spectrum" \
+                and _shared_vx_np is not None and _shared_vy_np is not None):
+                # Use native resolution of shared fields to avoid resampling artifacts
+                n_fd_use = int(_shared_vx_np.shape[0])
+                x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                    "LAX 2D (shared-field cpu)",
+                    lax_solution,
+                    time, n_fd_use, nu, lam, num_of_waves, rho_1,
+                    gravity=True, isplot=False, comparison=False, animation=True,
+                    vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
+                )
+            else:
+                if torch.cuda.is_available():
+                    _clear_cuda_cache()
+                    x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                        "LAX 2D (torch)",
+                        lax_solution_torch,
+                        time_val=time, N=N_use, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+                        vel_rms=vel_rms, random_seed=random_seed
+                    )
+                    _phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                else:
+                    x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = _timed_call(
+                        "LAX 2D (cpu)",
+                        lax_solution,
+                        time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                    )
+
+            Lx = lam * num_of_waves
+            Nx = x_fd.shape[0]
+            Ny = rho_fd.shape[1]
+            y_fd = np.linspace(0.0, Lx, Ny, endpoint=False)
+            X, Y = np.meshgrid(x_fd, y_fd, indexing='ij')
+
+    if ax is None:  # for single plot
+        plt.figure(figsize=(5, 5))
+        ax = plt.gca()
+
+    # Clean FD velocity fields and avoid zero-length arrows
+    vx_c = np.nan_to_num(vx_fd, nan=0.0, posinf=0.0, neginf=0.0)
+    vy_c = np.nan_to_num(vy_fd, nan=0.0, posinf=0.0, neginf=0.0)
+    Vmag_fd = np.sqrt(vx_c**2 + vy_c**2)
+    mask = Vmag_fd > 1e-12
+
+    if which == "density":
+        pc = ax.pcolormesh(X, Y, rho_fd, shading='auto', cmap='YlOrBr', vmin=np.min(rho_fd), vmax=np.max(rho_fd))
+        skip = (slice(None, None, max(1, Nx // 20)), slice(None, None, max(1, Ny // 20)))
+        ax.quiver(
+            X[skip][mask[skip]], Y[skip][mask[skip]],
+            vx_c[skip][mask[skip]], vy_c[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
+        ax.set_title("FD Density, t={}".format(round(time, 2)))
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.formatter.set_powerlimits((0, 0))
+        cbar.ax.set_title(r"$\rho$", fontsize=14)
+    else:
+        pc = ax.pcolormesh(X, Y, Vmag_fd, shading='auto', cmap='viridis', vmin=np.min(Vmag_fd), vmax=np.max(Vmag_fd))
+        skip = (slice(None, None, max(1, Nx // 20)), slice(None, None, max(1, Ny // 20)))
+        ax.quiver(
+            X[skip][mask[skip]], Y[skip][mask[skip]],
+            vx_c[skip][mask[skip]], vy_c[skip][mask[skip]],
+            color='k', headwidth=3.0, width=0.003,
+            scale_units='xy', angles='xy', scale=1.0, minlength=0.0, pivot='mid'
+        )
+        ax.set_title("FD Velocity, t={}".format(round(time, 2)))
+        cbar = plt.colorbar(pc, shrink=0.6, location='right')
+        cbar.ax.set_title(r" $|v|$", fontsize=14)
+
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+
+    return pc
+
+
+def create_2d_surface_plots_FD(initial_params, time_points=None, which="density", N=200, nu=0.5,
+                               use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                               fd_cache=None):
+    """
+    Create 2D surface plots at multiple time points using the LAX FD solver
+
+    Args:
+        initial_params: (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        time_points: list of times
+        which: "density" or "velocity"
+        N: grid size (only used if fd_cache is None)
+        nu: Courant number (only used if fd_cache is None)
+        use_velocity_ps: Whether to use velocity power spectrum (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS amplitude (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
+    """
+    if time_points is None:
+        time_points = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+    # Use config defaults if not specified to ensure consistency with PINN training
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+
+    print("Creating 2D FD surface plots...")
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+
+    for i, t in enumerate(time_points):
+        if i < len(axes):
+            print(f"FD plotting at t = {t}")
+            # Enforce grid policy: use N_GRID for power spectrum; else pass through N
+            if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                N_call = N_GRID
+            else:
+                N_call = N
+            Two_D_surface_plots_FD(t, initial_params, N=N_call, nu=nu, ax=axes[i], which=which,
+                                   use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed,
+                                   fd_cache=fd_cache)
+
+    if len(time_points) < len(axes):
+        fig.delaxes(axes[-1])
+
+    plt.tight_layout()
+    
+    # Save the figure to output folder
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"2d_surface_plots_FD_{which}.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 2D FD surface plots ({which}) to {save_path}")
+    
+    return fig, axes
+
+
+def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=0.5,
+                                use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                                fd_cache=None):
+    """
+    Create 5x3 comparison table showing PINN, FD, and epsilon metric at 5 time snapshots
+    
+    Args:
+        net: Trained neural network
+        initial_params: Tuple containing (xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax)
+        which: "density" or "velocity"
+        N: Grid resolution for LAX solver (only used if fd_cache is None)
+        nu: Courant number for LAX solver (only used if fd_cache is None)
+        use_velocity_ps: Whether to use velocity power spectrum for FD (defaults to config) - only used if fd_cache is None
+        ps_index: Power spectrum index for FD (defaults to POWER_EXPONENT) - only used if fd_cache is None
+        vel_rms: Velocity RMS for FD (defaults to a*cs) - only used if fd_cache is None
+        random_seed: Random seed for FD (defaults to 1234) - only used if fd_cache is None
+        fd_cache: Optional dictionary mapping time -> FD data (if provided, solver is not called)
+    """
+    xmin, xmax, ymin, ymax, rho_1, alpha, lam, output_folder, tmax = initial_params
+    
+    # Use config defaults if not specified to ensure consistency with PINN training
+    if use_velocity_ps is None:
+        use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
+    if ps_index is None:
+        ps_index = POWER_EXPONENT
+    if vel_rms is None:
+        vel_rms = a * cs
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    
+    # Handle both single network and list of networks
+    if isinstance(net, list):
+        nets = net
+        use_xpinn = len(nets) > 1
+    else:
+        nets = [net]
+        use_xpinn = False
+    
+    # Generate 5 time points uniformly distributed over [0, tmax]
+    time_points = np.linspace(0.0, float(tmax), 5)
+    
+    print(f"Creating 5x3 comparison table for {which}...")
+    
+    # Create 5x3 subplot grid
+    fig, axes = plt.subplots(5, 3, figsize=(15, 20))
+    
+    # Store data for consistent color limits
+    pinn_data = []
+    fd_data = []
+    pinn_velocity_data = []  # Store velocity components separately
+    fd_velocity_data = []    # Store velocity components separately
+    
+    # First pass: collect data to determine consistent color limits
+    for i, t in enumerate(time_points):
+        # print(f"Collecting data for t = {t:.2f}")  # Commented out to reduce output noise
+        
+        # Get PINN data - use N_GRID for consistency with FD solver
+        # Exclude right boundary for periodic domains to avoid double-counting
+        Q = N_GRID
+        xs = np.linspace(xmin, xmax, Q, endpoint=False)
+        ys = np.linspace(ymin, ymax, Q, endpoint=False)
+        tau, phi = np.meshgrid(xs, ys) 
+        Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
+        t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
+        
+        pt_x_collocation = Variable(torch.from_numpy(Xgrid[:, 0:1]).float(), requires_grad=True).to(device)
+        pt_y_collocation = Variable(torch.from_numpy(Xgrid[:, 1:2]).float(), requires_grad=True).to(device) if DIMENSION >= 2 else None
+        pt_z_collocation = Variable(torch.from_numpy(np.full((Q**2, 1), SLICE_Z)).float(), requires_grad=True).to(device) if DIMENSION >= 3 else None
+        pt_t_collocation = Variable(torch.from_numpy(t_00).float(), requires_grad=True).to(device)
+        
+        if use_xpinn:
+            output_00 = predict_xpinn(nets, pt_x_collocation, pt_y_collocation, pt_t_collocation, xmin, xmax, ymin, ymax)
+        else:
+            # Ensure inputs are on the same device as the model
+            net_device = next(nets[0].parameters()).device
+            pt_x_collocation = pt_x_collocation.to(net_device)
+            pt_t_collocation = pt_t_collocation.to(net_device)
+            if pt_y_collocation is not None:
+                pt_y_collocation = pt_y_collocation.to(net_device)
+            if pt_z_collocation is not None:
+                pt_z_collocation = pt_z_collocation.to(net_device)
+            output_00 = nets[0](_build_input_list(pt_x_collocation, pt_t_collocation, pt_y_collocation, pt_z_collocation))
+        
+        rho_tensor, vx_tensor, vy_tensor, _, _ = _split_outputs(output_00)
+        if which == "density":
+            pinn_field = rho_tensor.detach().cpu().numpy().reshape(Q, Q)
+        else:
+            vx_grid = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+            vy_grid = vy_tensor.detach().cpu().numpy().reshape(Q, Q) if vy_tensor is not None else np.zeros_like(vx_grid)
+            pinn_field = np.sqrt(vx_grid**2 + vy_grid**2)
+        pinn_vx = vx_tensor.detach().cpu().numpy().reshape(Q, Q)
+        pinn_vy = vy_tensor.detach().cpu().numpy().reshape(Q, Q) if vy_tensor is not None else np.zeros_like(pinn_vx)
+        
+        # Debug output (commented out to reduce noise)
+        # print(f"  PINN {which} range: [{np.min(pinn_field):.6f}, {np.max(pinn_field):.6f}], std: {np.std(pinn_field):.6f}")
+        
+        # Get FD data - use cached data if available, otherwise compute
+        num_of_waves = (xmax - xmin) / lam
+        
+        if fd_cache is not None and t in fd_cache:
+            # Use cached data
+            cache_data = fd_cache[t]
+            if DIMENSION == 3:
+                # For 3D, use volume data from cache if available, otherwise use 2D slice
+                if 'rho_vol' in cache_data:
+                    rho_vol = cache_data['rho_vol']
+                    vx_vol = cache_data['vx_vol']
+                    vy_vol = cache_data['vy_vol']
+                    phi_vol = cache_data.get('phi_vol')
+                    x_fd = cache_data['x']
+                    y_fd = cache_data['y']
+                    z_fd = cache_data['z']
+                    z_idx = cache_data.get('z_idx', np.argmin(np.abs(cache_data['z'] - SLICE_Z)))
+                else:
+                    # Fallback to 2D slice
+                    rho_vol = cache_data['rho'][:, :, np.newaxis]
+                    vx_vol = cache_data['vx'][:, :, np.newaxis]
+                    vy_vol = cache_data['vy'][:, :, np.newaxis]
+                    phi_vol = cache_data.get('phi')
+                    if phi_vol is not None:
+                        phi_vol = phi_vol[:, :, np.newaxis]
+                    x_fd = cache_data['x']
+                    y_fd = cache_data['y']
+                    z_fd = np.array([SLICE_Z])
+                    z_idx = 0
+                rho_fd = rho_vol[:, :, z_idx]
+                vx_fd = vx_vol[:, :, z_idx]
+                vy_fd = vy_vol[:, :, z_idx]
+                phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+            else:
+                x_fd = cache_data['x']
+                y_fd = cache_data['y']
+                rho_fd = cache_data['rho']
+                vx_fd = cache_data['vx']
+                vy_fd = cache_data['vy']
+                phi_fd = cache_data.get('phi')
+                if phi_fd is None:
+                    phi_fd = np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+        else:
+            # Compute FD data if not cached
+            if DIMENSION == 3:
+                # Use unified solver with proper IC type support
+                result = _call_unified_3d_solver(
+                    time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
+                    use_velocity_ps=use_velocity_ps, ps_index=ps_index,
+                    vel_rms=vel_rms, random_seed=random_seed
+                )
+                # Extract results from unified solver
+                x_fd = result.coordinates['x']
+                y_fd = result.coordinates['y']
+                z_fd = result.coordinates['z']
+                rho_vol = result.density
+                vx_vol, vy_vol, vz_vol = result.velocity_components
+                phi_vol = result.potential
+                z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
+                rho_fd = rho_vol[:, :, z_idx]
+                vx_fd = vx_vol[:, :, z_idx]
+                vy_fd = vy_vol[:, :, z_idx]
+                phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+            else:
+                if str(PERTURBATION_TYPE).lower() == "power_spectrum":
+                    if _shared_vx_np is not None and _shared_vy_np is not None:
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (shared-field cpu)",
+                            lax_solution,
+                            t, N, nu, lam, num_of_waves, rho_1,
+                            gravity=True, isplot=False, comparison=False, animation=True,
+                            vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
+                        )
+                    else:
+                        if torch.cuda.is_available():
+                            _clear_cuda_cache()
+                            x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                                "LAX 2D (torch)",
+                                lax_solution_torch,
+                                time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                                gravity=True, use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            )
+                            phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                        else:
+                            x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                                "LAX 2D (power cpu)",
+                                lax_solution,
+                                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                                use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            )
+                else:
+                    if torch.cuda.is_available():
+                        _clear_cuda_cache()
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
+                            "LAX 2D (torch)",
+                            lax_solution_torch,
+                            time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
+                            gravity=True, use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                        )
+                        phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                    else:
+                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
+                            "LAX 2D (sinusoidal cpu)",
+                            lax_solution,
+                            t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                            use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                        )
+                Lx = lam * num_of_waves
+                y_fd = np.linspace(0.0, Lx, rho_fd.shape[1], endpoint=False)
+                X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
+        
+        if which == "density":
+            fd_field = rho_fd
+        else:  # velocity magnitude
+            fd_field = np.sqrt(vx_fd**2 + vy_fd**2)
+        
+        # Interpolate FD data to PINN grid for comparison using single robust method
+        from scipy.interpolate import RegularGridInterpolator
+        points_fd = np.column_stack([X_fd.ravel(), Y_fd.ravel()])
+        points_pinn = np.column_stack([tau.ravel(), phi.ravel()])
+        
+        # Use RegularGridInterpolator for robust interpolation with proper boundary handling
+        # This avoids the interpolation cascade issues and provides consistent results
+        interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), fd_field, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_field_interp = interpolator(points_pinn)
+        
+        fd_field_interp = fd_field_interp.reshape(Q, Q)
+        
+        # Interpolate FD velocity components for vector plots using single robust method
+        vx_interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), vx_fd, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_vx_interp = vx_interpolator(points_pinn)
+        
+        vy_interpolator = RegularGridInterpolator(
+            (x_fd, y_fd), vy_fd, 
+            method='linear', 
+            bounds_error=False, 
+            fill_value=None  # extrapolate
+        )
+        fd_vy_interp = vy_interpolator(points_pinn)
+        
+        fd_vx_interp = fd_vx_interp.reshape(Q, Q)
+        fd_vy_interp = fd_vy_interp.reshape(Q, Q)
+        
+        pinn_data.append(pinn_field)
+        fd_data.append(fd_field_interp)
+        
+        # Store velocity components for vector plots (both density and velocity plots)
+        pinn_velocity_data.append((pinn_vx, pinn_vy))
+        fd_velocity_data.append((fd_vx_interp, fd_vy_interp))
+    
+    # Use individual color limits for each plot (like animation) to show dynamic range
+    # This allows collapse features to be visible, rather than using global limits
+    
+    # Second pass: create plots
+    for i, t in enumerate(time_points):
+        pinn_field = pinn_data[i]
+        fd_field = fd_data[i]
+        
+        # Extract velocity components for vector plots
+        pinn_vx, pinn_vy = pinn_velocity_data[i]
+        fd_vx, fd_vy = fd_velocity_data[i]
+        
+        # Calculate epsilon metric: ε = 2 * |PINN - FD| / (PINN + FD) * 100
+        # Use a more robust denominator to reduce sensitivity to small values
+        eps = 1e-6  # Increased from 1e-12 to reduce sensitivity
+        epsilon_metric = 200.0 * np.abs(pinn_field - fd_field) / (pinn_field + fd_field + eps)
+        
+        # Column 1: PINN - use individual color limits like animation
+        ax_pinn = axes[i, 0]
+        if which == "density":
+            pc_pinn = ax_pinn.pcolormesh(tau, phi, pinn_field, shading='auto', cmap='YlOrBr', 
+                                       vmin=np.min(pinn_field), vmax=np.max(pinn_field))
+        else:
+            pc_pinn = ax_pinn.pcolormesh(tau, phi, pinn_field, shading='auto', cmap='viridis', 
+                                       vmin=np.min(pinn_field), vmax=np.max(pinn_field))
+        
+        # Add velocity vectors for both density and velocity plots
+        if pinn_vx is not None and pinn_vy is not None:
+            # Subsample vectors for clarity (similar to analyze_lax.py)
+            skip_x = max(1, Q // 20)
+            skip_y = max(1, Q // 20)
+            skip = (slice(None, None, skip_x), slice(None, None, skip_y))
+            ax_pinn.quiver(tau[skip], phi[skip], pinn_vx[skip], pinn_vy[skip], 
+                          color='k', headwidth=3.0, width=0.003, alpha=0.7)
+        
+        ax_pinn.set_title(f"PINN {which.title()}, t={t:.2f}")
+        ax_pinn.set_xlim(xmin, xmax)
+        ax_pinn.set_ylim(ymin, ymax)
+        
+        # Add interface lines for XPINN
+        if use_xpinn:
+            add_interface_lines(ax_pinn, xmin, xmax, ymin, ymax)
+        
+        cbar_pinn = plt.colorbar(pc_pinn, ax=ax_pinn, shrink=0.6)
+        cbar_pinn.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
+        
+        # Column 2: FD - use individual color limits
+        ax_fd = axes[i, 1]
+        if which == "density":
+            pc_fd = ax_fd.pcolormesh(tau, phi, fd_field, shading='auto', cmap='YlOrBr', 
+                                    vmin=np.min(fd_field), vmax=np.max(fd_field))
+        else:
+            pc_fd = ax_fd.pcolormesh(tau, phi, fd_field, shading='auto', cmap='viridis', 
+                                    vmin=np.min(fd_field), vmax=np.max(fd_field))
+        
+        # Add velocity vectors for both density and velocity plots
+        if fd_vx is not None and fd_vy is not None:
+            # Subsample vectors for clarity (similar to analyze_lax.py)
+            skip_x = max(1, Q // 20)
+            skip_y = max(1, Q // 20)
+            skip = (slice(None, None, skip_x), slice(None, None, skip_y))
+            ax_fd.quiver(tau[skip], phi[skip], fd_vx[skip], fd_vy[skip], 
+                        color='k', headwidth=3.0, width=0.003, alpha=0.7)
+        
+        ax_fd.set_title(f"FD {which.title()}, t={t:.2f}")
+        ax_fd.set_xlim(xmin, xmax)
+        ax_fd.set_ylim(ymin, ymax)
+        cbar_fd = plt.colorbar(pc_fd, ax=ax_fd, shrink=0.6)
+        cbar_fd.ax.set_title(r"$\rho$" if which == "density" else r"$|v|$", fontsize=14)
+        
+        # Column 3: Epsilon Metric
+        ax_diff = axes[i, 2]
+        pc_diff = ax_diff.pcolormesh(tau, phi, epsilon_metric, shading='auto', cmap='coolwarm')
+        ax_diff.set_title(f"ε (%), t={t:.2f}")
+        ax_diff.set_xlim(xmin, xmax)
+        ax_diff.set_ylim(ymin, ymax)
+        cbar_diff = plt.colorbar(pc_diff, ax=ax_diff, shrink=0.6)
+        cbar_diff.ax.set_title("ε (%)", fontsize=14)
+        
+        # Add x-axis labels only on bottom row
+        if i == 4:
+            ax_pinn.set_xlabel("x")
+            ax_fd.set_xlabel("x")
+            ax_diff.set_xlabel("x")
+        
+        # Add y-axis labels only on leftmost column
+        ax_pinn.set_ylabel("y")
+    
+    plt.tight_layout()
+    
+    # Save the figure
+    output_dir = os.path.join(SNAPSHOT_DIR, "GRINN")
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"{which}_comparison_5x3.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Saved 5x3 comparison table to {save_path}")
+    
+    plt.show()
+    return fig, axes
