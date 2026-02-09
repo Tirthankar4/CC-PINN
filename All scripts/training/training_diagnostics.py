@@ -159,86 +159,157 @@ class TrainingDiagnostics:
         
         print(f"Training diagnostic plot saved to {self.save_dir}")
 
+    def _get_domain_bounds(self, model, dimension):
+        """Extract actual domain bounds from model, with fallback to [0,1]."""
+        xmin = model.xmin if hasattr(model, 'xmin') and model.xmin is not None else 0.0
+        xmax = model.xmax if hasattr(model, 'xmax') and model.xmax is not None else 1.0
+        ymin = model.ymin if hasattr(model, 'ymin') and model.ymin is not None else 0.0
+        ymax = model.ymax if hasattr(model, 'ymax') and model.ymax is not None else 1.0
+        zmin = model.zmin if hasattr(model, 'zmin') and model.zmin is not None else 0.0
+        zmax = model.zmax if hasattr(model, 'zmax') and model.zmax is not None else 1.0
+        
+        if dimension == 1:
+            return xmin, xmax, None, None, None, None
+        elif dimension == 2:
+            return xmin, xmax, ymin, ymax, None, None
+        else:  # dimension == 3
+            return xmin, xmax, ymin, ymax, zmin, zmax
+
     # ==================== POST-TRAINING DIAGNOSTICS FOR HIGH-TMAX FAILURES ====================
     
     def compute_residual_heatmap(self, model, dimension, tmax, n_spatial=None, n_temporal=60):
         """
-        Compute PDE residuals on a regular grid over space-time.
-        Critical for identifying WHERE and WHEN physics breaks down.
-        
-        Note: For power spectrum cases, uses higher resolution to match IC generation grid.
+        Compute PDE residuals on a regular grid over space-time using CHUNKING to avoid OOM.
         """
         from core.losses import pde_residue
         from config import PERTURBATION_TYPE, N_GRID, N_GRID_3D
         
         device = next(model.parameters()).device
         
-        # Use higher resolution for power spectrum to match IC generation
+        # Get actual domain bounds from the model
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
+        # Determine grid size
         if n_spatial is None:
             if str(PERTURBATION_TYPE).lower() == "power_spectrum":
                 n_spatial = min(150, N_GRID // 3) if dimension == 2 else min(100, N_GRID_3D // 3)
             else:
                 n_spatial = 80
         
-        print(f"  Computing residuals on {n_spatial}x{n_spatial}x{n_temporal} grid...")
+        print(f"  Computing residuals on {n_spatial}x{n_spatial}x{n_temporal} grid (Chunked)...")
         
         if dimension == 2:
-            x = torch.linspace(0, 1, n_spatial, device=device)
-            y = torch.linspace(0, 1, n_spatial, device=device)
+            x = torch.linspace(xmin, xmax, n_spatial, device=device)
+            y = torch.linspace(ymin, ymax, n_spatial, device=device)
             t = torch.linspace(0, tmax, n_temporal, device=device)
             
-            # Create meshgrid
             X, Y, T = torch.meshgrid(x, y, t, indexing='ij')
-            colloc = [X.reshape(-1, 1), Y.reshape(-1, 1), T.reshape(-1, 1)]
             
-            with torch.no_grad():
-                rho_r, vx_r, vy_r, phi_r = pde_residue(colloc, model, dimension=2)
+            # Flatten all points: (N_total, 1)
+            X_flat = X.reshape(-1, 1)
+            Y_flat = Y.reshape(-1, 1)
+            T_flat = T.reshape(-1, 1)
             
-            # Reshape back to grid
-            rho_r = rho_r.reshape(n_spatial, n_spatial, n_temporal).cpu().numpy()
-            vx_r = vx_r.reshape(n_spatial, n_spatial, n_temporal).cpu().numpy()
-            vy_r = vy_r.reshape(n_spatial, n_spatial, n_temporal).cpu().numpy()
-            phi_r = phi_r.reshape(n_spatial, n_spatial, n_temporal).cpu().numpy()
+            total_points = X_flat.shape[0]
+            
+            # Initialize result arrays (on CPU to save GPU memory)
+            rho_res_all = np.zeros(total_points, dtype=np.float32)
+            vx_res_all = np.zeros(total_points, dtype=np.float32)
+            vy_res_all = np.zeros(total_points, dtype=np.float32)
+            phi_res_all = np.zeros(total_points, dtype=np.float32)
+            
+            # Process in chunks
+            chunk_size = 40000
+            model.eval()
+            
+            for i in range(0, total_points, chunk_size):
+                end_idx = min(i + chunk_size, total_points)
+                
+                x_chunk = X_flat[i:end_idx].detach().clone().requires_grad_(True)
+                y_chunk = Y_flat[i:end_idx].detach().clone().requires_grad_(True)
+                t_chunk = T_flat[i:end_idx].detach().clone().requires_grad_(True)
+                
+                colloc_chunk = [x_chunk, y_chunk, t_chunk]
+                
+                rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_chunk, model, dimension=2)
+                
+                rho_res_all[i:end_idx] = rho_r.detach().cpu().numpy().flatten()
+                vx_res_all[i:end_idx] = vx_r.detach().cpu().numpy().flatten()
+                vy_res_all[i:end_idx] = vy_r.detach().cpu().numpy().flatten()
+                phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
+                
+                del x_chunk, y_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r, phi_r
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             
             return {
                 'x': x.cpu().numpy(),
                 'y': y.cpu().numpy(),
                 't': t.cpu().numpy(),
-                'rho_residual': rho_r,
-                'vx_residual': vx_r,
-                'vy_residual': vy_r,
-                'phi_residual': phi_r
+                'rho_residual': rho_res_all.reshape(n_spatial, n_spatial, n_temporal),
+                'vx_residual': vx_res_all.reshape(n_spatial, n_spatial, n_temporal),
+                'vy_residual': vy_res_all.reshape(n_spatial, n_spatial, n_temporal),
+                'phi_residual': phi_res_all.reshape(n_spatial, n_spatial, n_temporal)
             }
         
         elif dimension == 3:
             # For 3D, use coarser grid to save memory
             n_spatial_3d = max(32, n_spatial // 2)
-            x = torch.linspace(0, 1, n_spatial_3d, device=device)
-            y = torch.linspace(0, 1, n_spatial_3d, device=device)
-            z = torch.linspace(0, 1, n_spatial_3d, device=device)
+            x = torch.linspace(xmin, xmax, n_spatial_3d, device=device)
+            y = torch.linspace(ymin, ymax, n_spatial_3d, device=device)
             t = torch.linspace(0, tmax, n_temporal, device=device)
             
-            # For 3D, we'll slice at z=0.5 to create 2D heatmaps
-            z_slice = torch.full((n_spatial_3d * n_spatial_3d * n_temporal,), 0.5, device=device)
+            z_slice_val = 0.5
+            Z_slice = torch.full((n_spatial_3d, n_spatial_3d, n_temporal), z_slice_val, device=device)
             X, Y, T = torch.meshgrid(x, y, t, indexing='ij')
-            colloc = [X.reshape(-1, 1), Y.reshape(-1, 1), z_slice.reshape(-1, 1), T.reshape(-1, 1)]
             
-            with torch.no_grad():
-                rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc, model, dimension=3)
+            X_flat = X.reshape(-1, 1)
+            Y_flat = Y.reshape(-1, 1)
+            Z_flat = Z_slice.reshape(-1, 1)
+            T_flat = T.reshape(-1, 1)
             
-            rho_r = rho_r.reshape(n_spatial_3d, n_spatial_3d, n_temporal).cpu().numpy()
-            vx_r = vx_r.reshape(n_spatial_3d, n_spatial_3d, n_temporal).cpu().numpy()
-            vy_r = vy_r.reshape(n_spatial_3d, n_spatial_3d, n_temporal).cpu().numpy()
-            phi_r = phi_r.reshape(n_spatial_3d, n_spatial_3d, n_temporal).cpu().numpy()
+            total_points = X_flat.shape[0]
+            
+            rho_res_all = np.zeros(total_points, dtype=np.float32)
+            vx_res_all = np.zeros(total_points, dtype=np.float32)
+            vy_res_all = np.zeros(total_points, dtype=np.float32)
+            vz_res_all = np.zeros(total_points, dtype=np.float32)
+            phi_res_all = np.zeros(total_points, dtype=np.float32)
+            
+            chunk_size = 20000
+            model.eval()
+            
+            for i in range(0, total_points, chunk_size):
+                end_idx = min(i + chunk_size, total_points)
+                
+                x_chunk = X_flat[i:end_idx].detach().clone().requires_grad_(True)
+                y_chunk = Y_flat[i:end_idx].detach().clone().requires_grad_(True)
+                z_chunk = Z_flat[i:end_idx].detach().clone().requires_grad_(True)
+                t_chunk = T_flat[i:end_idx].detach().clone().requires_grad_(True)
+                
+                colloc_chunk = [x_chunk, y_chunk, z_chunk, t_chunk]
+                
+                rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_chunk, model, dimension=3)
+                
+                rho_res_all[i:end_idx] = rho_r.detach().cpu().numpy().flatten()
+                vx_res_all[i:end_idx] = vx_r.detach().cpu().numpy().flatten()
+                vy_res_all[i:end_idx] = vy_r.detach().cpu().numpy().flatten()
+                vz_res_all[i:end_idx] = vz_r.detach().cpu().numpy().flatten()
+                phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
+                
+                del x_chunk, y_chunk, z_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r, vz_r, phi_r
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             
             return {
                 'x': x.cpu().numpy(),
                 'y': y.cpu().numpy(),
                 't': t.cpu().numpy(),
-                'rho_residual': rho_r,
-                'vx_residual': vx_r,
-                'vy_residual': vy_r,
-                'phi_residual': phi_r
+                'rho_residual': rho_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
+                'vx_residual': vx_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
+                'vy_residual': vy_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
+                'vz_residual': vz_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
+                'phi_residual': phi_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal)
             }
     
     def plot_residual_heatmaps(self, residual_data, slice_idx=None):
@@ -266,15 +337,22 @@ class TrainingDiagnostics:
             resid_slice = resid[:, slice_idx, :].T  # (t, x) for imshow
             
             # Use log scale for better visualization
-            resid_log = np.log10(np.abs(resid_slice) + 1e-12)
+            resid_log = np.log10(np.abs(resid_slice) + 1e-16)
+            actual_min = np.min(resid_log)
+            data_max = np.max(resid_log)
+            data_min = max(data_max - 4, -12)
             
             im = ax.imshow(resid_log, aspect='auto', origin='lower', cmap='hot',
                           extent=[residual_data['x'][0], residual_data['x'][-1],
                                  residual_data['t'][0], residual_data['t'][-1]],
-                          vmin=-10, vmax=0)
+                          vmin=data_min, vmax=data_max)
             ax.set_xlabel('x', fontsize=11)
             ax.set_ylabel('Time', fontsize=11)
-            ax.set_title(f'{name} Residual (log₁₀)', fontsize=12, fontweight='bold')
+            ax.set_title(
+                f'{name} Residual\nMin: 10^{actual_min:.1f}, Max: 10^{data_max:.1f}',
+                fontsize=12,
+                fontweight='bold'
+            )
             cbar = plt.colorbar(im, ax=ax)
             cbar.set_label('log₁₀|residual|', fontsize=10)
         
@@ -294,6 +372,9 @@ class TrainingDiagnostics:
         
         device = next(model.parameters()).device
         
+        # Get actual domain bounds from the model
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
         # Use higher resolution for power spectrum
         if n_grid is None:
             if str(PERTURBATION_TYPE).lower() == "power_spectrum":
@@ -302,6 +383,7 @@ class TrainingDiagnostics:
                 n_grid = 100
         
         print(f"  Checking conservation laws at {n_times} time points on {n_grid}x{n_grid} grid...")
+        print(f"  Domain: x=[{xmin}, {xmax}], y=[{ymin}, {ymax}]" + (f", z=[{zmin}, {zmax}]" if dimension == 3 else ""))
         
         conservation_data = {
             'times': [],
@@ -314,8 +396,8 @@ class TrainingDiagnostics:
         
         for t_val in time_points:
             if dimension == 2:
-                x = torch.linspace(0, 1, n_grid, device=device)
-                y = torch.linspace(0, 1, n_grid, device=device)
+                x = torch.linspace(xmin, xmax, n_grid, device=device)
+                y = torch.linspace(ymin, ymax, n_grid, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
                 T = torch.full_like(X, t_val)
                 
@@ -327,11 +409,12 @@ class TrainingDiagnostics:
                     vx = pred[:, 1].reshape(n_grid, n_grid).cpu().numpy()
                     vy = pred[:, 2].reshape(n_grid, n_grid).cpu().numpy()
                 
-                # Integrate using trapezoidal rule
-                dx = 1.0 / (n_grid - 1)
-                total_mass = np.trapz(np.trapz(rho, dx=dx, axis=0), dx=dx)
-                total_px = np.trapz(np.trapz(rho * vx, dx=dx, axis=0), dx=dx)
-                total_py = np.trapz(np.trapz(rho * vy, dx=dx, axis=0), dx=dx)
+                # Integrate using trapezoidal rule with correct spacing
+                dx = (xmax - xmin) / (n_grid - 1)
+                dy = (ymax - ymin) / (n_grid - 1)
+                total_mass = np.trapz(np.trapz(rho, dx=dy, axis=1), dx=dx, axis=0)
+                total_px = np.trapz(np.trapz(rho * vx, dx=dy, axis=1), dx=dx, axis=0)
+                total_py = np.trapz(np.trapz(rho * vy, dx=dy, axis=1), dx=dx, axis=0)
                 
                 conservation_data['times'].append(t_val)
                 conservation_data['total_mass'].append(total_mass)
@@ -341,9 +424,9 @@ class TrainingDiagnostics:
             elif dimension == 3:
                 # For 3D, use coarser grid
                 n_grid_3d = max(40, n_grid // 2)
-                x = torch.linspace(0, 1, n_grid_3d, device=device)
-                y = torch.linspace(0, 1, n_grid_3d, device=device)
-                z = torch.linspace(0, 1, n_grid_3d, device=device)
+                x = torch.linspace(xmin, xmax, n_grid_3d, device=device)
+                y = torch.linspace(ymin, ymax, n_grid_3d, device=device)
+                z = torch.linspace(zmin, zmax, n_grid_3d, device=device)
                 X, Y, Z = torch.meshgrid(x, y, z, indexing='ij')
                 T = torch.full_like(X, t_val)
                 
@@ -355,10 +438,12 @@ class TrainingDiagnostics:
                     vx = pred[:, 1].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
                     vy = pred[:, 2].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
                 
-                dx = 1.0 / (n_grid_3d - 1)
-                total_mass = np.trapz(np.trapz(np.trapz(rho, dx=dx, axis=0), dx=dx, axis=0), dx=dx)
-                total_px = np.trapz(np.trapz(np.trapz(rho * vx, dx=dx, axis=0), dx=dx, axis=0), dx=dx)
-                total_py = np.trapz(np.trapz(np.trapz(rho * vy, dx=dx, axis=0), dx=dx, axis=0), dx=dx)
+                dx = (xmax - xmin) / (n_grid_3d - 1)
+                dy = (ymax - ymin) / (n_grid_3d - 1)
+                dz = (zmax - zmin) / (n_grid_3d - 1)
+                total_mass = np.trapz(np.trapz(np.trapz(rho, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_px = np.trapz(np.trapz(np.trapz(rho * vx, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_py = np.trapz(np.trapz(np.trapz(rho * vy, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
                 
                 conservation_data['times'].append(t_val)
                 conservation_data['total_mass'].append(total_mass)
@@ -371,6 +456,7 @@ class TrainingDiagnostics:
         """Plot conserved quantities over time - should be flat lines!"""
         fig = plt.figure(figsize=(16, 5))
         gs = GridSpec(1, 3, figure=fig)
+        from config import cs
         
         times = conservation_data['times']
         
@@ -379,6 +465,7 @@ class TrainingDiagnostics:
         mass = np.array(conservation_data['total_mass'])
         mass_initial = mass[0]
         mass_drift = ((mass - mass_initial) / mass_initial) * 100  # Percent drift
+        momentum_scale = mass_initial * cs
         ax1.plot(times, mass_drift, 'b-', linewidth=2.5)
         ax1.axhline(0, color='r', linestyle='--', linewidth=1.5, label='Perfect conservation')
         ax1.set_xlabel('Time', fontsize=11)
@@ -391,18 +478,9 @@ class TrainingDiagnostics:
         ax2 = fig.add_subplot(gs[0, 1])
         px = np.array(conservation_data['total_momentum_x'])
         px_initial = px[0]
-        
-        # Handle near-zero initial momentum properly
-        if abs(px_initial) < 1e-10:
-            # Plot absolute change for near-zero initial momentum
-            px_drift = (px - px_initial) * 1000  # Scale to milliunit for visibility
-            ylabel = 'Momentum X absolute change (×10⁻³)'
-            title_suffix = ' (near-zero initial)'
-        else:
-            # Plot percentage change for non-zero initial momentum
-            px_drift = ((px - px_initial) / abs(px_initial)) * 100
-            ylabel = 'Momentum X drift (%)'
-            title_suffix = ''
+        px_drift = ((px - px_initial) / momentum_scale) * 100
+        ylabel = 'Momentum X drift (% of M₀cₛ)'
+        title_suffix = ''
         
         ax2.plot(times, px_drift, 'g-', linewidth=2.5)
         ax2.axhline(0, color='r', linestyle='--', linewidth=1.5, label='Perfect conservation')
@@ -416,18 +494,9 @@ class TrainingDiagnostics:
         ax3 = fig.add_subplot(gs[0, 2])
         py = np.array(conservation_data['total_momentum_y'])
         py_initial = py[0]
-        
-        # Handle near-zero initial momentum properly
-        if abs(py_initial) < 1e-10:
-            # Plot absolute change for near-zero initial momentum
-            py_drift = (py - py_initial) * 1000  # Scale to milliunit for visibility
-            ylabel = 'Momentum Y absolute change (×10⁻³)'
-            title_suffix = ' (near-zero initial)'
-        else:
-            # Plot percentage change for non-zero initial momentum
-            py_drift = ((py - py_initial) / abs(py_initial)) * 100
-            ylabel = 'Momentum Y drift (%)'
-            title_suffix = ''
+        py_drift = ((py - py_initial) / momentum_scale) * 100
+        ylabel = 'Momentum Y drift (% of M₀cₛ)'
+        title_suffix = ''
         
         ax3.plot(times, py_drift, 'orange', linewidth=2.5)
         ax3.axhline(0, color='r', linestyle='--', linewidth=1.5, label='Perfect conservation')
@@ -448,6 +517,9 @@ class TrainingDiagnostics:
         """
         device = next(model.parameters()).device
         
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
         print(f"  Computing spectral content at {n_times} time points...")
         
         time_points = np.linspace(0, tmax, n_times)
@@ -455,8 +527,8 @@ class TrainingDiagnostics:
         
         for t_val in time_points:
             if dimension == 2:
-                x = torch.linspace(0, 1, n_grid, device=device)
-                y = torch.linspace(0, 1, n_grid, device=device)
+                x = torch.linspace(xmin, xmax, n_grid, device=device)
+                y = torch.linspace(ymin, ymax, n_grid, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
                 T = torch.full_like(X, t_val)
                 
@@ -470,9 +542,13 @@ class TrainingDiagnostics:
                 fft = np.fft.fft2(rho)
                 power = np.abs(np.fft.fftshift(fft))**2
                 
-                # Create wavenumber grid
-                kx = np.fft.fftfreq(n_grid, d=1.0/n_grid)
-                ky = np.fft.fftfreq(n_grid, d=1.0/n_grid)
+                # Create wavenumber grid with correct spacing
+                Lx = xmax - xmin
+                Ly = ymax - ymin
+                dx = Lx / n_grid
+                dy = Ly / n_grid
+                kx = 2 * np.pi * np.fft.fftfreq(n_grid, d=dx)
+                ky = 2 * np.pi * np.fft.fftfreq(n_grid, d=dy)
                 kx_shift = np.fft.fftshift(kx)
                 ky_shift = np.fft.fftshift(ky)
                 KX, KY = np.meshgrid(kx_shift, ky_shift, indexing='ij')
@@ -481,12 +557,12 @@ class TrainingDiagnostics:
                 spectra.append({'time': t_val, 'power': power, 'k': K, 'rho': rho})
             
             elif dimension == 3:
-                # For 3D, take a 2D slice at z=0.5
+                # For 3D, take a 2D slice at z=0.5 (middle of domain)
                 n_grid_3d = max(64, n_grid // 2)
-                x = torch.linspace(0, 1, n_grid_3d, device=device)
-                y = torch.linspace(0, 1, n_grid_3d, device=device)
+                x = torch.linspace(xmin, xmax, n_grid_3d, device=device)
+                y = torch.linspace(ymin, ymax, n_grid_3d, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
-                Z = torch.full_like(X, 0.5)
+                Z = torch.full_like(X, (zmin + zmax) / 2.0)
                 T = torch.full_like(X, t_val)
                 
                 colloc = [X.reshape(-1, 1), Y.reshape(-1, 1), Z.reshape(-1, 1), T.reshape(-1, 1)]
@@ -570,6 +646,9 @@ class TrainingDiagnostics:
         """
         device = next(model.parameters()).device
         
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
         print(f"  Computing temporal statistics at {n_times} time points...")
         
         time_points = np.linspace(0, tmax, n_times)
@@ -584,8 +663,8 @@ class TrainingDiagnostics:
         
         for t_val in time_points:
             if dimension == 2:
-                x = torch.linspace(0, 1, n_spatial, device=device)
-                y = torch.linspace(0, 1, n_spatial, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
                 T = torch.full_like(X, t_val)
                 
@@ -617,12 +696,12 @@ class TrainingDiagnostics:
                 stats['grad_rho_max'].append(np.max(grad_np))
             
             elif dimension == 3:
-                # For 3D, take a 2D slice at z=0.5 for computational efficiency
+                # For 3D, take a 2D slice at z=middle for computational efficiency
                 n_spatial_3d = max(50, n_spatial // 2)
-                x = torch.linspace(0, 1, n_spatial_3d, device=device)
-                y = torch.linspace(0, 1, n_spatial_3d, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial_3d, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial_3d, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
-                Z = torch.full_like(X, 0.5)
+                Z = torch.full_like(X, (zmin + zmax) / 2.0)
                 T = torch.full_like(X, t_val)
                 
                 X_flat = X.reshape(-1, 1)
@@ -745,10 +824,13 @@ class TrainingDiagnostics:
         
         n_spatial = 80 if dimension == 2 else 60
         
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
         for t_val in time_points:
             if dimension == 2:
-                x = torch.linspace(0, 1, n_spatial, device=device)
-                y = torch.linspace(0, 1, n_spatial, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
                 T = torch.full_like(X, t_val)
                 
@@ -758,10 +840,10 @@ class TrainingDiagnostics:
                 
                 colloc = [X_flat, Y_flat, T_flat]
             else:  # dimension == 3
-                x = torch.linspace(0, 1, n_spatial, device=device)
-                y = torch.linspace(0, 1, n_spatial, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
-                Z = torch.full_like(X, 0.5)
+                Z = torch.full_like(X, (zmin + zmax) / 2.0)
                 T = torch.full_like(X, t_val)
                 
                 X_flat = X.reshape(-1, 1).requires_grad_(True)
@@ -1089,18 +1171,21 @@ class TrainingDiagnostics:
         
         n_spatial = 80 if dimension == 2 else 60
         
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, dimension)
+        
         for t_val in time_points:
             if dimension == 2:
-                x = torch.linspace(0, 1, n_spatial, device=device)
-                y = torch.linspace(0, 1, n_spatial, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
                 T = torch.full_like(X, t_val)
                 colloc = [X.reshape(-1, 1), Y.reshape(-1, 1), T.reshape(-1, 1)]
             else:
-                x = torch.linspace(0, 1, n_spatial, device=device)
-                y = torch.linspace(0, 1, n_spatial, device=device)
+                x = torch.linspace(xmin, xmax, n_spatial, device=device)
+                y = torch.linspace(ymin, ymax, n_spatial, device=device)
                 X, Y = torch.meshgrid(x, y, indexing='ij')
-                Z = torch.full_like(X, 0.5)
+                Z = torch.full_like(X, (zmin + zmax) / 2.0)
                 T = torch.full_like(X, t_val)
                 colloc = [X.reshape(-1, 1), Y.reshape(-1, 1), Z.reshape(-1, 1), T.reshape(-1, 1)]
             
@@ -1349,14 +1434,17 @@ class TrainingDiagnostics:
             vz_true = true_ic_data['vz'].detach().cpu().numpy()
         
         # For visualization, create a regular grid
-        x = torch.linspace(0, 1, n_grid, device=device)
-        y = torch.linspace(0, 1, n_grid, device=device)
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, self.dimension)
+        
+        x = torch.linspace(xmin, xmax, n_grid, device=device)
+        y = torch.linspace(ymin, ymax, n_grid, device=device)
         X, Y = torch.meshgrid(x, y, indexing='ij')
         T = torch.zeros_like(X)
         
         if self.dimension == 3:
-            # For 3D, take z=0.5 slice
-            Z = torch.full_like(X, 0.5)
+            # For 3D, take z=middle slice
+            Z = torch.full_like(X, (zmin + zmax) / 2.0)
             colloc_viz = [X.reshape(-1, 1), Y.reshape(-1, 1), Z.reshape(-1, 1), T.reshape(-1, 1)]
         else:
             # For 2D
@@ -1381,9 +1469,10 @@ class TrainingDiagnostics:
         
         if self.dimension == 3:
             z_ic = colloc_IC[2].detach().cpu().numpy().flatten()
-            # Find points near z=0.5 for visualization
-            z_tolerance = 0.1
-            mask_z = np.abs(z_ic - 0.5) < z_tolerance
+            # Find points near z=middle for visualization
+            zmid = (zmin + zmax) / 2.0
+            z_tolerance = 0.1 * (zmax - zmin)  # 10% of domain
+            mask_z = np.abs(z_ic - zmid) < z_tolerance
         else:
             mask_z = np.ones(len(x_ic), dtype=bool)
         
@@ -1892,17 +1981,21 @@ class TrainingDiagnostics:
         
         if self.dimension == 3:
             z_ic = colloc_IC[2].detach().cpu().numpy().flatten()
-            # Use points near z=0.5 for 2D slice
-            z_tolerance = 0.1
-            mask_z = np.abs(z_ic - 0.5) < z_tolerance
+            # Use points near z=middle for 2D slice
+            zmid = (zmin + zmax) / 2.0
+            z_tolerance = 0.1 * (zmax - zmin)  # 10% of domain
+            mask_z = np.abs(z_ic - zmid) < z_tolerance
             if mask_z.sum() < 100:
                 mask_z = np.ones(len(z_ic), dtype=bool)
         else:
             mask_z = np.ones(len(x_ic), dtype=bool)
         
         # Create regular grid for FFT
-        x_grid = np.linspace(0, 1, n_grid)
-        y_grid = np.linspace(0, 1, n_grid)
+        # Get actual domain bounds
+        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, self.dimension)
+        
+        x_grid = np.linspace(xmin, xmax, n_grid)
+        y_grid = np.linspace(ymin, ymax, n_grid)
         X_grid, Y_grid = np.meshgrid(x_grid, y_grid, indexing='ij')
         
         # Interpolate from scattered IC points to regular grid
@@ -1925,13 +2018,17 @@ class TrainingDiagnostics:
             vz_pred_grid = griddata(points_ic, vz_pred[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
             vz_true_grid = griddata(points_ic, vz_true[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
         
-        # Compute power spectra
+        # Compute power spectra with correct domain spacing
         def compute_power_spectrum(field):
             fft = np.fft.fft2(field)
             power = np.abs(np.fft.fftshift(fft))**2
             
-            kx = np.fft.fftfreq(n_grid, d=1.0/n_grid)
-            ky = np.fft.fftfreq(n_grid, d=1.0/n_grid)
+            Lx = xmax - xmin
+            Ly = ymax - ymin
+            dx = Lx / n_grid
+            dy = Ly / n_grid
+            kx = 2 * np.pi * np.fft.fftfreq(n_grid, d=dx)
+            ky = 2 * np.pi * np.fft.fftfreq(n_grid, d=dy)
             kx_shift = np.fft.fftshift(kx)
             ky_shift = np.fft.fftshift(ky)
             KX, KY = np.meshgrid(kx_shift, ky_shift, indexing='ij')

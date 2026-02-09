@@ -36,6 +36,7 @@ MODULE_SPECS: List[Tuple[str, str]] = [
     ("training/physics.py", "training.physics"),
     ("training/trainer.py", "training.trainer"),
     ("visualization/Plotting.py", "visualization.Plotting"),
+    ("visualization/Interactive.py", "visualization.Interactive"),
     ("train.py", "train"),
 ]
 

@@ -38,6 +38,7 @@ from visualization.Plotting import create_1d_cross_sections_sinusoidal
 from visualization.Plotting import create_density_growth_plot
 from config import PLOT_DENSITY_GROWTH, GROWTH_PLOT_TMAX, GROWTH_PLOT_DT
 from config import FD_N_2D
+from config import ENABLE_INTERACTIVE_3D, INTERACTIVE_3D_RESOLUTION, INTERACTIVE_3D_TIME_STEPS
 
 
 def _save_trained_models(net):
@@ -313,6 +314,7 @@ net.set_domain(rmin=spatial_rmin, rmax=spatial_rmax, dimension=DIMENSION)
 # IC collocation stays at t=0 throughout
 collocation_IC = collocation_model.geo_time_coord(option="IC")
 
+
 # Generate extra collocation points at t=0 for Poisson enforcement (Option 3)
 from core.data_generator import generate_poisson_ic_points
 from config import N_POISSON_IC
@@ -325,12 +327,13 @@ collocation_poisson_ic = generate_poisson_ic_points(
 )
 print(f"Generated {N_POISSON_IC} extra collocation points at t=0 for Poisson enforcement")
 
+
 start_time = time.time()
 
 # Standard training
-print("Using standard training...")
 collocation_domain = collocation_model.geo_time_coord(option="Domain")
 
+print("Using standard training...")
 training_diagnostics = train(
     net=net,
     model=collocation_model,
@@ -356,41 +359,6 @@ print(f"[Timing] PINN training completed in {elapsed_time:.2f} seconds ({elapsed
 
 # Save model immediately after training completes
 _save_trained_models(net)
-
-# ==================== POST-TRAINING COMPREHENSIVE DIAGNOSTICS ====================
-# Run comprehensive diagnostics for high-tmax failure analysis
-# This generates 4 additional critical plots beyond the training diagnostics
-if ENABLE_TRAINING_DIAGNOSTICS and training_diagnostics is not None:
-    print("\n" + "="*70)
-    print("Running post-training comprehensive diagnostics...")
-    print("="*70)
-    
-    try:
-        # Run comprehensive diagnostics - generates 4 additional plots:
-        # 1. PDE Residual Heatmaps - WHERE/WHEN physics breaks
-        # 2. Conservation Laws - Mass/momentum conservation
-        # 3. Spectral Evolution - Frequency content analysis
-        # 4. Temporal Statistics - Error accumulation tracking
-        training_diagnostics.run_comprehensive_diagnostics(
-            model=net,
-            dimension=DIMENSION,
-            tmax=tmax
-        )
-        
-        print("\n" + "="*70)
-        print("All diagnostic plots generated successfully!")
-        print("Check ./diagnostics/ folder for:")
-        print("  1. training_diagnostics.png - Training convergence")
-        print("  2. residual_heatmaps.png - Spatiotemporal PDE violations")
-        print("  3. conservation_laws.png - Physical consistency")
-        print("  4. spectral_evolution.png - Frequency content")
-        print("  5. temporal_statistics.png - Field evolution")
-        print("="*70 + "\n")
-    except Exception as e:
-        print(f"[WARNING] Post-training diagnostics failed: {e}")
-        print("Training completed successfully, but diagnostic plots may be incomplete.")
-        import traceback
-        traceback.print_exc()
 
 # Comprehensive GPU memory cleanup after training
 # This properly frees model parameters, optimizer state, collocation points, etc.
@@ -426,6 +394,42 @@ if device.startswith('cuda'):
         _move_models_to_device([net], device)
         print("Model moved back to GPU for visualization")
 
+# ==================== POST-TRAINING COMPREHENSIVE DIAGNOSTICS ====================
+# Run comprehensive diagnostics for high-tmax failure analysis
+# This generates 4 additional critical plots beyond the training diagnostics
+if ENABLE_TRAINING_DIAGNOSTICS and training_diagnostics is not None:
+    print("\n" + "="*70)
+    print("Running post-training comprehensive diagnostics...")
+    print("="*70)
+    
+    try:
+        net.eval()
+        # Run comprehensive diagnostics - generates 4 additional plots:
+        # 1. PDE Residual Heatmaps - WHERE/WHEN physics breaks
+        # 2. Conservation Laws - Mass/momentum conservation
+        # 3. Spectral Evolution - Frequency content analysis
+        # 4. Temporal Statistics - Error accumulation tracking
+        training_diagnostics.run_comprehensive_diagnostics(
+            model=net,
+            dimension=DIMENSION,
+            tmax=tmax
+        )
+        
+        print("\n" + "="*70)
+        print("All diagnostic plots generated successfully!")
+        print("Check ./diagnostics/ folder for:")
+        print("  1. training_diagnostics.png - Training convergence")
+        print("  2. residual_heatmaps.png - Spatiotemporal PDE violations")
+        print("  3. conservation_laws.png - Physical consistency")
+        print("  4. spectral_evolution.png - Frequency content")
+        print("  5. temporal_statistics.png - Field evolution")
+        print("="*70 + "\n")
+    except Exception as e:
+        print(f"[WARNING] Post-training diagnostics failed: {e}")
+        print("Training completed successfully, but diagnostic plots may be incomplete.")
+        import traceback
+        traceback.print_exc()
+
 # ==================== VISUALIZATION ====================
 initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
 
@@ -442,6 +446,33 @@ if PLOT_DENSITY_GROWTH:
         tmax_growth = float(TMAX_CFG)
     dt_growth = float(GROWTH_PLOT_DT)
     create_density_growth_plot(net, initial_params, tmax=tmax_growth, dt=dt_growth)
+
+# ==================== 3D INTERACTIVE VISUALIZATION ====================
+if DIMENSION == 3 and ENABLE_INTERACTIVE_3D:
+    try:
+        from visualization.Interactive import create_interactive_3d_plot
+        from config import SNAPSHOT_DIR
+
+        print("\n" + "="*70)
+        print("Generating 3D interactive plot...")
+        print("="*70)
+
+        save_path = os.path.join(SNAPSHOT_DIR, "interactive_3d_plot.html")
+        create_interactive_3d_plot(
+            net=net,
+            initial_params=initial_params,
+            time_range=(tmin, tmax),
+            time_steps=INTERACTIVE_3D_TIME_STEPS,
+            resolution=INTERACTIVE_3D_RESOLUTION,
+            save_path=save_path,
+        )
+
+        print(f"Interactive 3D plot saved to: {save_path}")
+        print("="*70 + "\n")
+    except Exception as e:
+        print(f"[WARNING] 3D interactive plot generation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ==================== FINAL CACHE CLEANUP ====================
 script_root = os.path.dirname(os.path.abspath(__file__))
