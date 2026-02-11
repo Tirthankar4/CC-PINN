@@ -89,7 +89,7 @@ class FDSolutionManager:
     reuse existing solutions.
     """
 
-    def __init__(self, initial_params, lam, num_of_waves, rho_1, perturbation_type, shared_vx=None, shared_vy=None):
+    def __init__(self, initial_params, lam, num_of_waves, rho_1, perturbation_type, shared_vx=None, shared_vy=None, shared_vz=None):
         xmin, xmax, ymin, ymax, *_ = initial_params
         self.xmin = xmin
         self.xmax = xmax
@@ -103,6 +103,7 @@ class FDSolutionManager:
         self.dimension = DIMENSION
         self.shared_vx = shared_vx
         self.shared_vy = shared_vy
+        self.shared_vz = shared_vz
         self.cache = {}
 
     def _normalize_backend(self, backend):
@@ -117,13 +118,15 @@ class FDSolutionManager:
         """
         backend_key = self._normalize_backend(backend)
         if N is None:
-            default_n = FD_N_3D if (self.dimension >= 3 and self.perturbation_type == "sinusoidal") else N_GRID
+            # Use FD_N_3D for all 3D cases, N_GRID for 2D cases
+            default_n = FD_N_3D if self.dimension >= 3 else N_GRID
             N_eff = default_n
         else:
             N_eff = int(N)
 
         use_velocity_ps = (self.perturbation_type == "power_spectrum")
-        use_3d = self.dimension >= 3 and self.perturbation_type == "sinusoidal"
+        # Use 3D solver for all 3D cases (both sinusoidal and power_spectrum)
+        use_3d = self.dimension >= 3
         cache_key = (
             round(float(time_value), 8),
             int(N_eff),
@@ -230,7 +233,8 @@ class FDSolutionManager:
 
     def _run_solver_3d(self, time_value, N, nu, backend_key):
         """
-        Execute 3D sinusoidal FD solver (torch or numpy version) and package results.
+        Execute 3D FD solver (torch or numpy version) and package results.
+        Supports both sinusoidal and power_spectrum perturbation types.
         """
         xmin, ymin, zmin_local = self.xmin, self.ymin, self.zmin
         lam = self.lam
@@ -251,10 +255,22 @@ class FDSolutionManager:
                 'lam': lam
             }
             
-            ic_params = {'KX': KX, 'KY': KY, 'KZ': 0.0}
+            # Determine IC type based on perturbation type
+            if self.perturbation_type == "power_spectrum":
+                ic_type = 'power_spectrum'
+                ic_params = {
+                    'shared_vx': self.shared_vx,
+                    'shared_vy': self.shared_vy,
+                    'shared_vz': self.shared_vz,
+                    'random_seed': RANDOM_SEED
+                }
+            else:
+                ic_type = 'sinusoidal'
+                ic_params = {'KX': KX, 'KY': KY, 'KZ': 0.0}
+            
             options = {'gravity': True, 'nu': nu, 'comparison': False, 'isplot': False}
             
-            result = lax_solver_torch(time_value, domain_params, physics_params, ic_type='sinusoidal', ic_params=ic_params, options=options)
+            result = lax_solver_torch(time_value, domain_params, physics_params, ic_type=ic_type, ic_params=ic_params, options=options)
             
             x_fd = result.coordinates['x'] + xmin
             y_fd = result.coordinates['y'] + ymin
@@ -262,6 +278,10 @@ class FDSolutionManager:
             rho_fd = result.density
             vx_fd, vy_fd, vz_fd = result.velocity_components
         else:
+            # CPU version - currently only supports sinusoidal
+            if self.perturbation_type == "power_spectrum":
+                raise NotImplementedError("3D power spectrum simulations require GPU backend (--fd-backend gpu)")
+            
             fd_result = lax_solution_3d_sinusoidal(
                 time_value, N, nu, lam, num_of_waves, rho_1, gravity=True
             )
@@ -1461,13 +1481,24 @@ def main():
     # Initialize shared velocity fields for consistent PINN/FD initial conditions
     shared_vx_np = None
     shared_vy_np = None
+    shared_vz_np = None
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         v_1 = a * cs
-        shared_vx_np, shared_vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
-        set_shared_velocity_fields(shared_vx_np, shared_vy_np)
+        result = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
+        if len(result) == 3:
+            # 3D case
+            shared_vx_np, shared_vy_np, shared_vz_np = result
+            set_shared_velocity_fields(shared_vx_np, shared_vy_np, shared_vz_np)
+        else:
+            # 2D case
+            shared_vx_np, shared_vy_np = result
+            set_shared_velocity_fields(shared_vx_np, shared_vy_np)
     
     initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
-    fd_cache = FDSolutionManager(initial_params, lam, num_of_waves, rho_1, PERTURBATION_TYPE, shared_vx_np, shared_vy_np)
+    if DIMENSION >= 3:
+        fd_cache = FDSolutionManager(initial_params, lam, num_of_waves, rho_1, PERTURBATION_TYPE, shared_vx_np, shared_vy_np, shared_vz_np)
+    else:
+        fd_cache = FDSolutionManager(initial_params, lam, num_of_waves, rho_1, PERTURBATION_TYPE, shared_vx_np, shared_vy_np)
     
     # Generate plots
     save_plots = not args.no_save

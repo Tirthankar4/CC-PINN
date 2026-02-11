@@ -22,7 +22,7 @@ DIMENSION = 2  # Spatial dimension
 BATCH_SIZE = 75000  # Max collocation points per mini-batch (controls peak GPU memory)
 NUM_BATCHES = 1  # Mini-batches per optimizer step; gradients accumulate, memory stays constant
 
-a = 1.3
+a = 0.1
 
 tmin = 0.
 tmax = 3.0

@@ -1,34 +1,24 @@
 import os
+import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TrainingDiagnostics:
     """
     Comprehensive diagnostics for PINN performance analysis.
     
-    TWO DIAGNOSTIC MODES:
-    
-    1. LONG-TERM EVOLUTION MODE (2D, 3D sinusoidal, 3D power spectrum at t>0)
-       Focus: Why does PINN fail at long times?
-       Generates 6 diagnostic plots:
-         - Training diagnostics: Loss convergence and balance
-         - PDE residual evolution: When/where/which equations fail
-         - Conservation violations: Mass and momentum drift
-         - Temporal error accumulation: How errors compound over time
-         - Spectral bias analysis: Frequency damping and mode evolution
-         - Solution stability: Detecting unphysical behavior
-    
-    2. IC FITTING MODE (3D power spectrum only)
-       Focus: Why can't PINN fit complex initial conditions?
-       Generates 5 diagnostic plots:
-         - Training diagnostics: Loss convergence with IC component breakdown
-         - IC spatial comparison: Predicted vs true IC fields
-         - IC power spectrum: Scale-by-scale fit quality
-         - IC component convergence: Which component fails to converge
-         - IC metrics summary: Correlation and RMS error statistics
+    Focus: Why does PINN fail at long times?
+    Generates 6 diagnostic plots:
+      - Training diagnostics: Loss convergence and balance
+      - PDE residual evolution: When/where/which equations fail
+      - Conservation violations: Mass and momentum drift
+      - Temporal error accumulation: How errors compound over time
+      - Spectral bias analysis: Frequency damping and mode evolution
+      - Solution stability: Detecting unphysical behavior
     
     All diagnostics run automatically when ENABLE_TRAINING_DIAGNOSTICS = True
     """
@@ -37,7 +27,6 @@ class TrainingDiagnostics:
         self.save_dir = save_dir
         self.dimension = dimension
         self.perturbation_type = str(perturbation_type).lower()
-        self.is_3d_power_spectrum = (dimension == 3 and self.perturbation_type == 'power_spectrum')
         
         os.makedirs(save_dir, exist_ok=True)
 
@@ -50,16 +39,6 @@ class TrainingDiagnostics:
             'mean_rho': [],
             'max_rho': [],
         }
-        
-        # Additional tracking for 3D power spectrum IC diagnostics
-        if self.is_3d_power_spectrum:
-            self.history.update({
-                'ic_rho': [],
-                'ic_vx': [],
-                'ic_vy': [],
-                'ic_vz': [],
-                'ic_phi': [],
-            })
 
     def _prepare_inputs(self, geomtime_col):
         """Normalize collocation inputs to the model's expected format."""
@@ -68,7 +47,7 @@ class TrainingDiagnostics:
         # Single tensor [N, D] -> list of [N,1]
         return [geomtime_col[:, i:i+1] for i in range(geomtime_col.shape[1])]
 
-    def log_iteration(self, iteration, model, loss_dict, geomtime_col, ic_component_losses=None):
+    def log_iteration(self, iteration, model, loss_dict, geomtime_col):
         """
         Call this every N iterations during training.
         
@@ -77,7 +56,6 @@ class TrainingDiagnostics:
             model: PINN model
             loss_dict: Dictionary with 'total', 'PDE', 'IC' losses
             geomtime_col: Collocation points
-            ic_component_losses: (Optional) Dict with component IC losses for 3D power spectrum
         """
         self.history['iteration'].append(iteration)
         self.history['total_loss'].append(float(loss_dict.get('total', np.nan)))
@@ -94,14 +72,6 @@ class TrainingDiagnostics:
             # Density statistics
             self.history['mean_rho'].append(np.nanmean(rho))
             self.history['max_rho'].append(np.nanmax(rho))
-        
-        # Track component IC losses for 3D power spectrum
-        if self.is_3d_power_spectrum and ic_component_losses is not None:
-            self.history['ic_rho'].append(float(ic_component_losses.get('rho', np.nan)))
-            self.history['ic_vx'].append(float(ic_component_losses.get('vx', np.nan)))
-            self.history['ic_vy'].append(float(ic_component_losses.get('vy', np.nan)))
-            self.history['ic_vz'].append(float(ic_component_losses.get('vz', np.nan)))
-            self.history['ic_phi'].append(float(ic_component_losses.get('phi', np.nan)))
 
     def plot_diagnostics(self, iteration=None):
         """
@@ -389,7 +359,8 @@ class TrainingDiagnostics:
             'times': [],
             'total_mass': [],
             'total_momentum_x': [],
-            'total_momentum_y': []
+            'total_momentum_y': [],
+            'total_momentum_z': []  # For 3D cases
         }
         
         time_points = np.linspace(0, tmax, n_times)
@@ -412,9 +383,9 @@ class TrainingDiagnostics:
                 # Integrate using trapezoidal rule with correct spacing
                 dx = (xmax - xmin) / (n_grid - 1)
                 dy = (ymax - ymin) / (n_grid - 1)
-                total_mass = np.trapz(np.trapz(rho, dx=dy, axis=1), dx=dx, axis=0)
-                total_px = np.trapz(np.trapz(rho * vx, dx=dy, axis=1), dx=dx, axis=0)
-                total_py = np.trapz(np.trapz(rho * vy, dx=dy, axis=1), dx=dx, axis=0)
+                total_mass = np.trapezoid(np.trapezoid(rho, dx=dy, axis=1), dx=dx, axis=0)
+                total_px = np.trapezoid(np.trapezoid(rho * vx, dx=dy, axis=1), dx=dx, axis=0)
+                total_py = np.trapezoid(np.trapezoid(rho * vy, dx=dy, axis=1), dx=dx, axis=0)
                 
                 conservation_data['times'].append(t_val)
                 conservation_data['total_mass'].append(total_mass)
@@ -437,18 +408,21 @@ class TrainingDiagnostics:
                     rho = pred[:, 0].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
                     vx = pred[:, 1].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
                     vy = pred[:, 2].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
+                    vz = pred[:, 3].reshape(n_grid_3d, n_grid_3d, n_grid_3d).cpu().numpy()
                 
                 dx = (xmax - xmin) / (n_grid_3d - 1)
                 dy = (ymax - ymin) / (n_grid_3d - 1)
                 dz = (zmax - zmin) / (n_grid_3d - 1)
-                total_mass = np.trapz(np.trapz(np.trapz(rho, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
-                total_px = np.trapz(np.trapz(np.trapz(rho * vx, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
-                total_py = np.trapz(np.trapz(np.trapz(rho * vy, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_mass = np.trapezoid(np.trapezoid(np.trapezoid(rho, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_px = np.trapezoid(np.trapezoid(np.trapezoid(rho * vx, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_py = np.trapezoid(np.trapezoid(np.trapezoid(rho * vy, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
+                total_pz = np.trapezoid(np.trapezoid(np.trapezoid(rho * vz, dx=dz, axis=2), dx=dy, axis=1), dx=dx, axis=0)
                 
                 conservation_data['times'].append(t_val)
                 conservation_data['total_mass'].append(total_mass)
                 conservation_data['total_momentum_x'].append(total_px)
                 conservation_data['total_momentum_y'].append(total_py)
+                conservation_data['total_momentum_z'].append(total_pz)
         
         return conservation_data
     
@@ -574,8 +548,13 @@ class TrainingDiagnostics:
                 fft = np.fft.fft2(rho)
                 power = np.abs(np.fft.fftshift(fft))**2
                 
-                kx = np.fft.fftfreq(n_grid_3d, d=1.0/n_grid_3d)
-                ky = np.fft.fftfreq(n_grid_3d, d=1.0/n_grid_3d)
+                # Use physical wavenumbers with correct spacing (consistent with 2D case)
+                Lx = xmax - xmin
+                Ly = ymax - ymin
+                dx = Lx / n_grid_3d
+                dy = Ly / n_grid_3d
+                kx = 2 * np.pi * np.fft.fftfreq(n_grid_3d, d=dx)
+                ky = 2 * np.pi * np.fft.fftfreq(n_grid_3d, d=dy)
                 kx_shift = np.fft.fftshift(kx)
                 ky_shift = np.fft.fftshift(ky)
                 KX, KY = np.meshgrid(kx_shift, ky_shift, indexing='ij')
@@ -793,6 +772,12 @@ class TrainingDiagnostics:
                 ax3.legend(fontsize=10)
                 ax3.grid(True, alpha=0.3, which='both')
         
+        # Add parameterization info for proper interpretation
+        from config import PERTURBATION_TYPE, USE_PARAMETERIZATION
+        param_info = f"[{PERTURBATION_TYPE}, ρ-param: {USE_PARAMETERIZATION}]"
+        fig.text(0.99, 0.01, param_info, ha='right', va='bottom', fontsize=8, 
+                 fontstyle='italic', color='gray', transform=fig.transFigure)
+        
         plt.tight_layout()
         plt.savefig(f'{self.save_dir}/temporal_statistics.png', dpi=150, bbox_inches='tight')
         plt.close()
@@ -886,21 +871,44 @@ class TrainingDiagnostics:
                 vz = pred[:, 3:4]
                 error_data['field_ranges']['vz'].append(torch.std(vz).item())
             
-            # Track gradient norms for ALL fields including phi
+            # Track gradient norms for ALL fields including phi (full gradient magnitude)
             with torch.enable_grad():
+                # Compute full gradient magnitudes: |∇f| = sqrt((∂f/∂x)² + (∂f/∂y)² + ...)
                 rho_grad_x = torch.autograd.grad(rho.sum(), X_flat, create_graph=False, retain_graph=True)[0]
+                rho_grad_y = torch.autograd.grad(rho.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 vx_grad_x = torch.autograd.grad(vx.sum(), X_flat, create_graph=False, retain_graph=True)[0]
+                vx_grad_y = torch.autograd.grad(vx.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 vy_grad_x = torch.autograd.grad(vy.sum(), X_flat, create_graph=False, retain_graph=True)[0]
+                vy_grad_y = torch.autograd.grad(vy.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 phi_grad_x = torch.autograd.grad(phi.sum(), X_flat, create_graph=False, retain_graph=True)[0]
+                phi_grad_y = torch.autograd.grad(phi.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 
-                error_data['gradient_norms']['rho'].append(torch.norm(rho_grad_x).item())
-                error_data['gradient_norms']['vx'].append(torch.norm(vx_grad_x).item())
-                error_data['gradient_norms']['vy'].append(torch.norm(vy_grad_x).item())
-                error_data['gradient_norms']['phi'].append(torch.norm(phi_grad_x).item())
+                # Compute full gradient magnitudes
+                rho_grad_mag = torch.sqrt(rho_grad_x**2 + rho_grad_y**2)
+                vx_grad_mag = torch.sqrt(vx_grad_x**2 + vx_grad_y**2)
+                vy_grad_mag = torch.sqrt(vy_grad_x**2 + vy_grad_y**2)
+                phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2)
                 
                 if dimension == 3:
+                    rho_grad_z = torch.autograd.grad(rho.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
+                    vx_grad_z = torch.autograd.grad(vx.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
+                    vy_grad_z = torch.autograd.grad(vy.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
                     vz_grad_x = torch.autograd.grad(vz.sum(), X_flat, create_graph=False, retain_graph=True)[0]
-                    error_data['gradient_norms']['vz'].append(torch.norm(vz_grad_x).item())
+                    vz_grad_y = torch.autograd.grad(vz.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
+                    vz_grad_z = torch.autograd.grad(vz.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
+                    phi_grad_z = torch.autograd.grad(phi.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
+                    
+                    rho_grad_mag = torch.sqrt(rho_grad_x**2 + rho_grad_y**2 + rho_grad_z**2)
+                    vx_grad_mag = torch.sqrt(vx_grad_x**2 + vx_grad_y**2 + vx_grad_z**2)
+                    vy_grad_mag = torch.sqrt(vy_grad_x**2 + vy_grad_y**2 + vy_grad_z**2)
+                    phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2 + phi_grad_z**2)
+                    vz_grad_mag = torch.sqrt(vz_grad_x**2 + vz_grad_y**2 + vz_grad_z**2)
+                    error_data['gradient_norms']['vz'].append(torch.norm(vz_grad_mag).item())
+                
+                error_data['gradient_norms']['rho'].append(torch.norm(rho_grad_mag).item())
+                error_data['gradient_norms']['vx'].append(torch.norm(vx_grad_mag).item())
+                error_data['gradient_norms']['vy'].append(torch.norm(vy_grad_mag).item())
+                error_data['gradient_norms']['phi'].append(torch.norm(phi_grad_mag).item())
             
             # Max residual magnitude (now including Poisson!)
             max_res = max(
@@ -1297,6 +1305,12 @@ class TrainingDiagnostics:
         ax6.legend(fontsize=9)
         ax6.grid(True, alpha=0.3)
         
+        # Add parameterization info for proper interpretation of density metrics
+        from config import PERTURBATION_TYPE, USE_PARAMETERIZATION
+        param_info = f"[{PERTURBATION_TYPE}, ρ-param: {USE_PARAMETERIZATION}]"
+        fig.text(0.99, 0.01, param_info, ha='right', va='bottom', fontsize=8,
+                 fontstyle='italic', color='gray', transform=fig.transFigure)
+        
         plt.suptitle('Solution Stability and Physical Validity Analysis', fontsize=14, fontweight='bold', y=0.995)
         plt.savefig(f'{self.save_dir}/solution_stability.png', dpi=150, bbox_inches='tight')
         plt.close()
@@ -1362,753 +1376,182 @@ class TrainingDiagnostics:
         print("  3. conservation_laws.png - Conservation law drift over time")
         print("  4. temporal_error_accumulation.png - Error growth and compounding")
         print("  5. spectral_bias_analysis.png - Frequency damping and spectral issues")
-        print("  6. solution_stability.png - Physical validity and stability metrics")
         print("="*70 + "\n")
+
+
+# ==================== STANDALONE EXECUTION MODE ====================
+
+def load_model_for_diagnostics(model_path, device='cuda', dimension=None):
+    """
+    Load a saved PINN model for standalone diagnostics.
     
+    Args:
+        model_path: Path to saved model (.pth file)
+        device: Device to load model on ('cuda' or 'cpu')
+        dimension: Spatial dimension (2 or 3). If None, uses DIMENSION from config.
     
-    def run_case_specific_diagnostics(self, model, tmax=None, true_ic_data=None):
-        """
-        Smart dispatcher: runs appropriate diagnostics based on case type.
-        
-        - 2D cases (any perturbation): High-tmax temporal evolution diagnostics
-        - 3D power spectrum: IC fitting diagnostics  
-        - 3D sinusoidal: High-tmax temporal evolution diagnostics (fallback to 2D approach)
-        
-        Args:
-            model: Trained PINN model
-            tmax: Maximum time (required for 2D or 3D non-power-spectrum cases)
-            true_ic_data: Dict with IC data (required for 3D power spectrum)
-                         {'colloc_IC', 'rho', 'vx', 'vy', 'vz'}
-        """
-        if self.is_3d_power_spectrum:
-            # 3D power spectrum: Focus on IC fitting
-            if true_ic_data is None:
-                raise ValueError("true_ic_data required for 3D power spectrum diagnostics")
-            self.run_3d_power_spectrum_diagnostics(model, true_ic_data)
-        else:
-            # All other cases: Focus on temporal evolution
-            if tmax is None:
-                raise ValueError("tmax required for temporal evolution diagnostics")
-            self.run_comprehensive_diagnostics(model, self.dimension, tmax)
-    # ==================== 3D POWER SPECTRUM IC DIAGNOSTICS ====================
+    Returns:
+        Loaded PINN model ready for diagnostics
+    """
+    from config import (DIMENSION, harmonics, wave, num_of_waves, 
+                        xmin, ymin, zmin)
+    from core.model_architecture import PINN
     
-    def compute_ic_spatial_comparison(self, model, true_ic_data, n_grid=80):
-        """
-        Compare predicted vs true ICs spatially for both 2D and 3D cases.
-        Critical for diagnosing WHERE the network fails to fit the IC structure.
-        
-        Args:
-            model: Trained PINN model
-            true_ic_data: Dict with IC collocation points and true values
-                         2D: {'colloc_IC', 'rho', 'vx', 'vy'}
-                         3D: {'colloc_IC', 'rho', 'vx', 'vy', 'vz'}
-            n_grid: Grid resolution per dimension (for visualization grid)
-        
-        Returns:
-            Dict with predicted and true fields, plus errors
-        """
-        device = next(model.parameters()).device
-        
-        print(f"  Computing IC spatial comparison on training IC points...")
-        
-        # Use the actual IC collocation points from training
-        colloc_IC = true_ic_data['colloc_IC']
-        
-        # Get predictions at IC points
-        with torch.no_grad():
-            pred = model(colloc_IC)
-            rho_pred = pred[:, 0].cpu().numpy()
-            vx_pred = pred[:, 1].cpu().numpy()
-            vy_pred = pred[:, 2].cpu().numpy()
-            if self.dimension == 3:
-                vz_pred = pred[:, 3].cpu().numpy()
-                phi_pred = pred[:, 4].cpu().numpy()
-            else:
-                phi_pred = pred[:, 3].cpu().numpy()
-        
-        # Get true ICs (detach in case they have gradients)
-        rho_true = true_ic_data['rho'].detach().cpu().numpy()
-        vx_true = true_ic_data['vx'].detach().cpu().numpy()
-        vy_true = true_ic_data['vy'].detach().cpu().numpy()
-        if self.dimension == 3 and true_ic_data['vz'] is not None:
-            vz_true = true_ic_data['vz'].detach().cpu().numpy()
-        
-        # For visualization, create a regular grid
-        # Get actual domain bounds
-        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, self.dimension)
-        
-        x = torch.linspace(xmin, xmax, n_grid, device=device)
-        y = torch.linspace(ymin, ymax, n_grid, device=device)
-        X, Y = torch.meshgrid(x, y, indexing='ij')
-        T = torch.zeros_like(X)
-        
-        if self.dimension == 3:
-            # For 3D, take z=middle slice
-            Z = torch.full_like(X, (zmin + zmax) / 2.0)
-            colloc_viz = [X.reshape(-1, 1), Y.reshape(-1, 1), Z.reshape(-1, 1), T.reshape(-1, 1)]
-        else:
-            # For 2D
-            colloc_viz = [X.reshape(-1, 1), Y.reshape(-1, 1), T.reshape(-1, 1)]
-        
-        # Get predictions on visualization grid
-        with torch.no_grad():
-            pred_viz = model(colloc_viz)
-            rho_pred_viz = pred_viz[:, 0].reshape(n_grid, n_grid).cpu().numpy()
-            vx_pred_viz = pred_viz[:, 1].reshape(n_grid, n_grid).cpu().numpy()
-            vy_pred_viz = pred_viz[:, 2].reshape(n_grid, n_grid).cpu().numpy()
-            if self.dimension == 3:
-                vz_pred_viz = pred_viz[:, 3].reshape(n_grid, n_grid).cpu().numpy()
-                phi_pred_viz = pred_viz[:, 4].reshape(n_grid, n_grid).cpu().numpy()
-            else:
-                phi_pred_viz = pred_viz[:, 3].reshape(n_grid, n_grid).cpu().numpy()
-        
-        # For "true" visualization, we need to interpolate from IC points to regular grid
-        # Extract spatial coordinates from IC collocation points (detach first)
-        x_ic = colloc_IC[0].detach().cpu().numpy().flatten()
-        y_ic = colloc_IC[1].detach().cpu().numpy().flatten()
-        
-        if self.dimension == 3:
-            z_ic = colloc_IC[2].detach().cpu().numpy().flatten()
-            # Find points near z=middle for visualization
-            zmid = (zmin + zmax) / 2.0
-            z_tolerance = 0.1 * (zmax - zmin)  # 10% of domain
-            mask_z = np.abs(z_ic - zmid) < z_tolerance
-        else:
-            mask_z = np.ones(len(x_ic), dtype=bool)
-        
-        if mask_z.sum() > 100:  # Need enough points for interpolation
-            from scipy.interpolate import griddata
-            points_ic = np.column_stack([x_ic[mask_z], y_ic[mask_z]])
-            X_viz = X.cpu().numpy()
-            Y_viz = Y.cpu().numpy()
-            points_viz = np.column_stack([X_viz.flatten(), Y_viz.flatten()])
-            
-            # Interpolate with nearest neighbor fallback for NaN values
-            rho_true_viz = griddata(points_ic, rho_true[mask_z], points_viz, method='linear', fill_value=np.nan).reshape(n_grid, n_grid)
-            vx_true_viz = griddata(points_ic, vx_true[mask_z], points_viz, method='linear', fill_value=np.nan).reshape(n_grid, n_grid)
-            vy_true_viz = griddata(points_ic, vy_true[mask_z], points_viz, method='linear', fill_value=np.nan).reshape(n_grid, n_grid)
-            
-            # For uniform density (all values the same), fill NaNs with the constant value
-            # For varying fields, use nearest neighbor interpolation for NaN regions
-            if np.isnan(rho_true_viz).any():
-                if np.std(rho_true[mask_z]) < 1e-10:
-                    # Uniform field - fill with mean
-                    rho_true_viz = np.nan_to_num(rho_true_viz, nan=np.mean(rho_true[mask_z]))
-                else:
-                    # Varying field - use nearest neighbor for gaps
-                    rho_nn = griddata(points_ic, rho_true[mask_z], points_viz, method='nearest').reshape(n_grid, n_grid)
-                    rho_true_viz = np.where(np.isnan(rho_true_viz), rho_nn, rho_true_viz)
-            
-            if np.isnan(vx_true_viz).any():
-                vx_nn = griddata(points_ic, vx_true[mask_z], points_viz, method='nearest').reshape(n_grid, n_grid)
-                vx_true_viz = np.where(np.isnan(vx_true_viz), vx_nn, vx_true_viz)
-            
-            if np.isnan(vy_true_viz).any():
-                vy_nn = griddata(points_ic, vy_true[mask_z], points_viz, method='nearest').reshape(n_grid, n_grid)
-                vy_true_viz = np.where(np.isnan(vy_true_viz), vy_nn, vy_true_viz)
-            
-            if self.dimension == 3:
-                vz_true_viz = griddata(points_ic, vz_true[mask_z], points_viz, method='linear', fill_value=np.nan).reshape(n_grid, n_grid)
-                if np.isnan(vz_true_viz).any():
-                    vz_nn = griddata(points_ic, vz_true[mask_z], points_viz, method='nearest').reshape(n_grid, n_grid)
-                    vz_true_viz = np.where(np.isnan(vz_true_viz), vz_nn, vz_true_viz)
-        else:
-            # Not enough points for interpolation, use predicted as reference
-            print("  [WARN] Not enough IC points for ground truth visualization")
-            rho_true_viz = rho_pred_viz
-            vx_true_viz = vx_pred_viz
-            vy_true_viz = vy_pred_viz
-            if self.dimension == 3:
-                vz_true_viz = vz_pred_viz
-        
-        result = {
-            'x': x.cpu().numpy(),
-            'y': y.cpu().numpy(),
-            'rho_pred': rho_pred_viz,
-            'rho_true': rho_true_viz,
-            'vx_pred': vx_pred_viz,
-            'vx_true': vx_true_viz,
-            'vy_pred': vy_pred_viz,
-            'vy_true': vy_true_viz,
-            'phi_pred': phi_pred_viz,
-            # Also store scatter point data for metrics
-            'rho_pred_scatter': rho_pred,
-            'rho_true_scatter': rho_true,
-            'vx_pred_scatter': vx_pred,
-            'vx_true_scatter': vx_true,
-            'vy_pred_scatter': vy_pred,
-            'vy_true_scatter': vy_true,
-        }
-        
-        if self.dimension == 3:
-            result.update({
-                'vz_pred': vz_pred_viz,
-                'vz_true': vz_true_viz,
-                'vz_pred_scatter': vz_pred,
-                'vz_true_scatter': vz_true,
-            })
-        
-        return result
+    if dimension is None:
+        dimension = DIMENSION
     
-    def plot_ic_power_spectrum_comparison(self, ps_data):
-        """
-        Plot power spectrum comparison for all velocity components.
-        Shows which scales (k-modes) are missing or damped.
-        """
-        fig = plt.figure(figsize=(16, 5))
-        gs = GridSpec(1, 3, figure=fig)
-        
-        components = [('vx', 'X-Velocity'), ('vy', 'Y-Velocity'), ('vz', 'Z-Velocity')]
-        
-        for idx, (comp, label) in enumerate(components):
-            ax = fig.add_subplot(gs[0, idx])
-            
-            # Radial binning
-            K = ps_data['K']
-            power_pred = ps_data[f'power_{comp}_pred']
-            power_true = ps_data[f'power_{comp}_true']
-            
-            k_max = np.max(K)
-            k_bins = np.linspace(0, k_max, 30)
-            power_pred_avg = []
-            power_true_avg = []
-            k_centers = []
-            
-            for i in range(len(k_bins)-1):
-                mask = (K >= k_bins[i]) & (K < k_bins[i+1])
-                if mask.any():
-                    power_pred_avg.append(np.mean(power_pred[mask]))
-                    power_true_avg.append(np.mean(power_true[mask]))
-                    k_centers.append((k_bins[i] + k_bins[i+1]) / 2)
-            
-            if len(k_centers) > 0:
-                ax.loglog(k_centers, power_true_avg, 'r-', linewidth=2.5, label='True IC', marker='o', markersize=4)
-                ax.loglog(k_centers, power_pred_avg, 'b--', linewidth=2.5, label='Predicted', marker='s', markersize=4)
-                
-                ax.set_xlabel('Wavenumber k', fontsize=11)
-                ax.set_ylabel('Power', fontsize=11)
-                ax.set_title(f'{label} Power Spectrum', fontsize=12, fontweight='bold')
-                ax.legend(fontsize=10)
-                ax.grid(True, alpha=0.3, which='both')
-        
-        plt.suptitle('IC Power Spectrum: Predicted vs True', fontsize=14, fontweight='bold', y=0.98)
-        plt.tight_layout()
-        plt.savefig(f'{self.save_dir}/ic_power_spectrum.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    # Calculate domain bounds (same as train.py)
+    lam = wave
+    xmax = xmin + lam * num_of_waves
+    ymax = ymin + lam * num_of_waves
+    zmax = zmin + lam * num_of_waves
     
-    def plot_ic_component_convergence(self):
-        """
-        Plot IC component loss convergence over training.
-        Shows WHICH component (rho, vx, vy, vz, phi) is hardest to fit.
-        """
-        if not self.is_3d_power_spectrum or len(self.history['iteration']) == 0:
-            print("IC component tracking not available.")
-            return
-        
-        iters = self.history['iteration']
-        
-        # Replace zeros and very small values with a minimum threshold for log plotting
-        def safe_log_data(data):
-            """Replace zeros/negative values with small epsilon for log plotting."""
-            data_array = np.array(data)
-            data_array = np.where(data_array <= 0, 1e-12, data_array)
-            return data_array
-        
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
-        
-        # Plot 1: All IC components on same plot
-        ax1 = fig.add_subplot(gs[0, :])
-        
-        # Check if rho is zero/constant (uniform field case)
-        rho_is_uniform = np.max(self.history['ic_rho']) < 1e-10
-        
-        if not rho_is_uniform:
-            ax1.semilogy(iters, safe_log_data(self.history['ic_rho']), linewidth=2, label='ρ', 
-                        marker='o', markersize=3, markevery=max(1, len(iters)//20))
-        else:
-            # Plot a dashed line at the bottom to indicate uniform/zero loss
-            ax1.axhline(1e-12, color='C0', linestyle='--', linewidth=2, label='ρ (uniform IC, no loss)', alpha=0.5)
-        
-        ax1.semilogy(iters, safe_log_data(self.history['ic_vx']), linewidth=2, label='vx', 
-                    marker='s', markersize=3, markevery=max(1, len(iters)//20))
-        ax1.semilogy(iters, safe_log_data(self.history['ic_vy']), linewidth=2, label='vy', 
-                    marker='^', markersize=3, markevery=max(1, len(iters)//20))
-        ax1.semilogy(iters, safe_log_data(self.history['ic_vz']), linewidth=2, label='vz', 
-                    marker='d', markersize=3, markevery=max(1, len(iters)//20))
-        ax1.semilogy(iters, safe_log_data(self.history['ic_phi']), linewidth=2, label='φ', 
-                    marker='v', markersize=3, markevery=max(1, len(iters)//20))
-        
-        ax1.set_xlabel('Iteration', fontsize=11)
-        ax1.set_ylabel('Loss (log scale)', fontsize=11)
-        ax1.set_title('IC Component Losses', fontsize=12, fontweight='bold')
-        ax1.legend(fontsize=10, ncol=5)
-        ax1.grid(True, alpha=0.3)
-        
-        # Individual component plots
-        components = [
-            ('ic_rho', 'ρ (Density)', gs[1, 0], rho_is_uniform),
-            ('ic_vx', 'vx (X-Velocity)', gs[1, 1], False),
-            ('ic_vy', 'vy (Y-Velocity)', gs[1, 2], False),
-        ]
-        
-        for hist_key, title, grid_pos, is_uniform in components:
-            ax = fig.add_subplot(grid_pos)
-            if is_uniform:
-                # Show a flat line at bottom with annotation
-                ax.axhline(1e-12, color='steelblue', linestyle='--', linewidth=2.5, alpha=0.5)
-                ax.text(0.5, 0.5, 'Uniform IC\n(no spatial variation)', 
-                       transform=ax.transAxes, ha='center', va='center',
-                       fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-                ax.set_ylim([1e-13, 1e-10])
-            else:
-                ax.semilogy(iters, safe_log_data(self.history[hist_key]), linewidth=2.5, color='steelblue')
-            
-            ax.set_xlabel('Iteration', fontsize=10)
-            ax.set_ylabel('Loss (log scale)', fontsize=10)
-            ax.set_title(title, fontsize=11, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-        
-        plt.suptitle('IC Component Convergence Analysis', fontsize=14, fontweight='bold', y=0.995)
-        plt.savefig(f'{self.save_dir}/ic_component_convergence.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    # Create PINN with correct architecture
+    net = PINN(n_harmonics=harmonics)
     
-    def compute_ic_correlation_metrics(self, model, true_ic_data):
-        """
-        Compute spatial correlation between predicted and true ICs.
-        High correlation = good spatial structure capture.
-        """
-        print(f"  Computing IC correlation metrics on training IC points...")
-        
-        # Use IC collocation points
-        colloc_IC = true_ic_data['colloc_IC']
-        
-        # Get predictions
-        with torch.no_grad():
-            pred = model(colloc_IC)
-            rho_pred = pred[:, 0].cpu().numpy().flatten()
-            vx_pred = pred[:, 1].cpu().numpy().flatten()
-            vy_pred = pred[:, 2].cpu().numpy().flatten()
-            if self.dimension == 3:
-                vz_pred = pred[:, 3].cpu().numpy().flatten()
-        
-        # Get true ICs (detach in case they have gradients)
-        rho_true = true_ic_data['rho'].detach().cpu().numpy().flatten()
-        vx_true = true_ic_data['vx'].detach().cpu().numpy().flatten()
-        vy_true = true_ic_data['vy'].detach().cpu().numpy().flatten()
-        if self.dimension == 3 and true_ic_data['vz'] is not None:
-            vz_true = true_ic_data['vz'].detach().cpu().numpy().flatten()
-        
-        # Compute correlations - handle uniform fields (zero variance)
-        def safe_corrcoef(pred, true):
-            """Compute correlation, handling constant fields gracefully."""
-            # Check if either field is constant
-            if np.std(pred) < 1e-10 or np.std(true) < 1e-10:
-                # For uniform fields, correlation is undefined
-                # If both are uniform and equal, perfect match (1.0)
-                # If different constants, poor match (use normalized error)
-                if np.std(pred) < 1e-10 and np.std(true) < 1e-10:
-                    # Both uniform - check if they match
-                    mean_diff = abs(np.mean(pred) - np.mean(true))
-                    return 1.0 if mean_diff < 1e-6 else 0.0
-                else:
-                    # One uniform, one not - cannot capture structure
-                    return 0.0
-            else:
-                return np.corrcoef(pred, true)[0, 1]
-        
-        correlations = {
-            'rho': safe_corrcoef(rho_pred, rho_true),
-            'vx': safe_corrcoef(vx_pred, vx_true),
-            'vy': safe_corrcoef(vy_pred, vy_true),
-        }
-        
-        # Compute RMS errors
-        rms_errors = {
-            'rho': np.sqrt(np.mean((rho_pred - rho_true)**2)),
-            'vx': np.sqrt(np.mean((vx_pred - vx_true)**2)),
-            'vy': np.sqrt(np.mean((vy_pred - vy_true)**2)),
-        }
-        
-        if self.dimension == 3:
-            correlations['vz'] = safe_corrcoef(vz_pred, vz_true)
-            rms_errors['vz'] = np.sqrt(np.mean((vz_pred - vz_true)**2))
-        
-        return correlations, rms_errors
+    # Set domain bounds for periodic features
+    if dimension == 1:
+        spatial_rmin = [xmin]
+        spatial_rmax = [xmax]
+    elif dimension == 2:
+        spatial_rmin = [xmin, ymin]
+        spatial_rmax = [xmax, ymax]
+    else:  # dimension == 3
+        spatial_rmin = [xmin, ymin, zmin]
+        spatial_rmax = [xmax, ymax, zmax]
     
-    def plot_ic_metrics_summary(self, correlations, rms_errors):
-        """
-        Summary plot: correlation and RMS error for each IC component.
-        Quick visual diagnostic of IC fitting quality.
-        """
-        fig = plt.figure(figsize=(14, 5))
-        gs = GridSpec(1, 2, figure=fig)
-        
-        components = ['rho', 'vx', 'vy', 'vz']
-        labels = ['ρ', 'vx', 'vy', 'vz']
-        
-        # Correlation plot
-        ax1 = fig.add_subplot(gs[0, 0])
-        corr_vals = [correlations[c] for c in components]
-        
-        # Handle NaN/inf correlations from uniform fields
-        corr_vals_safe = []
-        for val in corr_vals:
-            if np.isnan(val) or np.isinf(val):
-                corr_vals_safe.append(0.0)  # Show as 0 for visualization
-            else:
-                corr_vals_safe.append(val)
-        
-        colors = ['green' if c > 0.9 else 'orange' if c > 0.7 else 'red' for c in corr_vals_safe]
-        bars1 = ax1.bar(labels, corr_vals_safe, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
-        ax1.axhline(1.0, color='b', linestyle='--', linewidth=1.5, label='Perfect correlation')
-        ax1.axhline(0.9, color='g', linestyle=':', linewidth=1.5, label='Good threshold')
-        ax1.set_ylabel('Correlation Coefficient', fontsize=11)
-        ax1.set_title('Spatial Correlation: Predicted vs True IC', fontsize=12, fontweight='bold')
-        ax1.set_ylim([0, 1.05])
-        ax1.legend(fontsize=10)
-        ax1.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar, val, orig_val in zip(bars1, corr_vals_safe, corr_vals):
-            height = bar.get_height()
-            if np.isnan(orig_val) or np.isinf(orig_val):
-                label_text = 'N/A\n(uniform)'
-                fontsize = 8
-            else:
-                label_text = f'{val:.3f}'
-                fontsize = 10
-            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                    label_text, ha='center', va='bottom', fontsize=fontsize, fontweight='bold')
-        
-        # RMS Error plot
-        ax2 = fig.add_subplot(gs[0, 1])
-        rms_vals = [rms_errors[c] for c in components]
-        bars2 = ax2.bar(labels, rms_vals, color='steelblue', alpha=0.7, edgecolor='black', linewidth=1.5)
-        ax2.set_ylabel('RMS Error', fontsize=11)
-        ax2.set_title('RMS Error: Predicted vs True IC', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar, val in zip(bars2, rms_vals):
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
-        plt.suptitle('IC Fitting Quality Metrics', fontsize=14, fontweight='bold', y=0.98)
-        plt.tight_layout()
-        plt.savefig(f'{self.save_dir}/ic_metrics_summary.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    net.set_domain(rmin=spatial_rmin, rmax=spatial_rmax, dimension=dimension)
     
-    def run_3d_power_spectrum_diagnostics(self, model, true_ic_data):
-        """
-        Run diagnostics for 3D power spectrum case.
-        Focus on IC fitting quality, not temporal evolution.
-        
-        Generates 5 critical diagnostic plots:
-        1. Training diagnostics (loss, balance, density) - already generated
-        2. IC spatial comparison (predicted vs true fields)
-        3. IC power spectrum comparison (scale-by-scale)
-        4. IC component convergence (which component fails)
-        5. IC metrics summary (correlation and RMS error)
-        
-        Args:
-            model: Trained PINN model
-            true_ic_data: Dict with IC data {'colloc_IC', 'rho', 'vx', 'vy', 'vz'}
-        """
-        print("\n" + "="*70)
-        print("  Running 3D Power Spectrum IC Diagnostics")
-        print("="*70)
-        
-        # Plot 2: IC Spatial Comparison
-        print("\n[1/4] Computing IC spatial comparison...")
-        ic_data = self.compute_ic_spatial_comparison(model, true_ic_data)
-        self.plot_ic_spatial_comparison(ic_data)
-        print("      [OK] IC spatial comparison saved")
-        
-        # Plot 3: IC Power Spectrum Comparison
-        print("\n[2/4] Computing IC power spectrum comparison...")
-        ps_data = self.compute_ic_power_spectrum_comparison(model, true_ic_data)
-        self.plot_ic_power_spectrum_comparison(ps_data)
-        print("      [OK] IC power spectrum comparison saved")
-        
-        # Plot 4: IC Component Convergence
-        print("\n[3/4] Plotting IC component convergence...")
-        self.plot_ic_component_convergence()
-        print("      [OK] IC component convergence saved")
-        
-        # Plot 5: IC Metrics Summary
-        print("\n[4/4] Computing IC metrics summary...")
-        correlations, rms_errors = self.compute_ic_correlation_metrics(model, true_ic_data)
-        self.plot_ic_metrics_summary(correlations, rms_errors)
-        print("      [OK] IC metrics summary saved")
-        
-        print("\n" + "="*70)
-        print(f"  All diagnostics saved to: {self.save_dir}")
-        print("="*70)
-        print("\nDiagnostic Summary:")
-        print("  1. training_diagnostics.png - Training convergence analysis")
-        print("  2. ic_spatial_comparison.png - Predicted vs true IC fields")
-        print("  3. ic_power_spectrum.png - Scale-by-scale power spectrum fit")
-        print("  4. ic_component_convergence.png - Which IC component fails")
-        print("  5. ic_metrics_summary.png - Correlation and RMS error metrics")
-        print("="*70 + "\n")
-        
-        # Print numerical summary
-        print("\nIC Fitting Quality Summary:")
-        print("-" * 50)
-        print(f"{'Component':<15} {'Correlation':<15} {'RMS Error':<15}")
-        print("-" * 50)
-        for comp in ['rho', 'vx', 'vy', 'vz']:
-            print(f"{comp:<15} {correlations[comp]:>14.4f} {rms_errors[comp]:>14.6f}")
-        print("-" * 50)
-        avg_corr = np.mean([correlations[c] for c in ['rho', 'vx', 'vy', 'vz']])
-        print(f"{'Average':<15} {avg_corr:>14.4f}")
-        print("-" * 50 + "\n")
+    # Load saved weights
+    state_dict = torch.load(model_path, map_location=device)
+    net.load_state_dict(state_dict)
+    net = net.to(device)
+    net.eval()
     
-    # ==================== UNIFIED DIAGNOSTICS (5 PLOTS FOR ALL CASES) ====================
+    print(f"Loaded model from: {model_path}")
+    print(f"  Dimension: {dimension}D")
+    print(f"  Domain: x=[{xmin}, {xmax}], y=[{ymin}, {ymax}]" + 
+          (f", z=[{zmin}, {zmax}]" if dimension == 3 else ""))
+    print(f"  Device: {device}")
     
-    def run_unified_diagnostics(self, model, true_ic_data, final_iteration):
-        """
-        Unified diagnostics that generate exactly 5 plots for all cases (2D/3D, any perturbation).
-        
-        The 5 plots are:
-        1. Training diagnostics (loss convergence and balance)
-        2. IC spatial comparison (predicted vs true fields)
-        3. IC power spectrum (for power_spectrum) or field spectrum (for sinusoidal)
-        4. IC component convergence (which component fails)
-        5. IC metrics summary (correlation and RMS error)
-        
-        Args:
-            model: Trained PINN model
-            true_ic_data: Dict with IC data {'colloc_IC', 'rho', 'vx', 'vy', 'vz'}
-            final_iteration: Final iteration number
-        """
-        print("\n" + "="*70)
-        print("  Running Unified Training Diagnostics (5 plots)")
-        print("="*70)
-        
-        # Plot 1: Training diagnostics
-        print("\n[1/5] Plotting training diagnostics...")
-        self.plot_diagnostics(final_iteration)
-        print("      [OK] Training diagnostics saved")
-        
-        # Plot 2: IC Spatial Comparison
-        print("\n[2/5] Computing IC spatial comparison...")
-        ic_data = self.compute_ic_spatial_comparison(model, true_ic_data)
-        self.plot_ic_spatial_comparison(ic_data)
-        print("      [OK] IC spatial comparison saved")
-        
-        # Plot 3: IC Power/Field Spectrum Comparison
-        print("\n[3/5] Computing spectrum comparison...")
-        if self.perturbation_type == 'power_spectrum':
-            # For power spectrum: compare power spectra
-            ps_data = self.compute_ic_power_spectrum_comparison(model, true_ic_data)
-            self.plot_ic_power_spectrum_comparison(ps_data)
-        else:
-            # For sinusoidal: compute field spectra from predictions
-            ps_data = self.compute_field_spectrum_comparison(model, true_ic_data)
-            self.plot_field_spectrum_comparison(ps_data)
-        print("      [OK] Spectrum comparison saved")
-        
-        # Plot 4: IC Component Convergence
-        print("\n[4/5] Plotting IC component convergence...")
-        self.plot_ic_component_convergence()
-        print("      [OK] IC component convergence saved")
-        
-        # Plot 5: IC Metrics Summary
-        print("\n[5/5] Computing IC metrics summary...")
-        correlations, rms_errors = self.compute_ic_correlation_metrics(model, true_ic_data)
-        self.plot_ic_metrics_summary(correlations, rms_errors)
-        print("      [OK] IC metrics summary saved")
-        
-        print("\n" + "="*70)
-        print(f"  All diagnostics saved to: {self.save_dir}")
-        print("="*70)
-        print("\nDiagnostic Summary:")
-        print("  1. training_diagnostics.png - Training convergence analysis")
-        print("  2. ic_spatial_comparison.png - Predicted vs true IC fields")
-        print("  3. ic_power_spectrum.png - Spectrum comparison")
-        print("  4. ic_component_convergence.png - IC component convergence")
-        print("  5. ic_metrics_summary.png - Correlation and RMS error metrics")
-        print("="*70 + "\n")
-        
-        # Print numerical summary
-        print("\nIC Fitting Quality Summary:")
-        print("-" * 50)
-        print(f"{'Component':<15} {'Correlation':<15} {'RMS Error':<15}")
-        print("-" * 50)
-        comps = ['rho', 'vx', 'vy', 'vz'] if self.dimension == 3 else ['rho', 'vx', 'vy']
-        for comp in comps:
-            if comp in correlations:
-                print(f"{comp:<15} {correlations[comp]:>14.4f} {rms_errors[comp]:>14.6f}")
-        print("-" * 50)
-        avg_corr = np.mean([correlations[c] for c in comps if c in correlations])
-        print(f"{'Average':<15} {avg_corr:>14.4f}")
-        print("-" * 50 + "\n")
+    return net
+
+
+def parse_args():
+    """Parse command-line arguments for standalone execution."""
+    import argparse
     
-    def compute_field_spectrum_comparison(self, model, true_ic_data, n_grid=128):
+    parser = argparse.ArgumentParser(
+        description="Run comprehensive PINN diagnostics on a saved model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python training_diagnostics.py --model ./GRINN/model.pth
+  python training_diagnostics.py --model ./model.pth --output ./my_diagnostics/ --tmax 5.0
+  python training_diagnostics.py --model ./model.pth --device cpu
         """
-        For sinusoidal cases: Compute power spectra of predicted vs true IC fields.
-        Similar to power spectrum comparison but computed from actual fields.
-        """
-        device = next(model.parameters()).device
-        
-        print(f"  Computing field spectrum comparison on IC points...")
-        
-        # Use IC collocation points
-        colloc_IC = true_ic_data['colloc_IC']
-        
-        # Get predictions
-        with torch.no_grad():
-            pred = model(colloc_IC)
-            rho_pred = pred[:, 0].cpu().numpy()
-            vx_pred = pred[:, 1].cpu().numpy()
-            vy_pred = pred[:, 2].cpu().numpy()
-            if self.dimension == 3:
-                vz_pred = pred[:, 3].cpu().numpy()
-        
-        # Get true ICs
-        rho_true = true_ic_data['rho'].detach().cpu().numpy()
-        vx_true = true_ic_data['vx'].detach().cpu().numpy()
-        vy_true = true_ic_data['vy'].detach().cpu().numpy()
-        if self.dimension == 3:
-            vz_true = true_ic_data['vz'].detach().cpu().numpy()
-        
-        # Need to interpolate to regular grid for FFT
-        x_ic = colloc_IC[0].detach().cpu().numpy().flatten()
-        y_ic = colloc_IC[1].detach().cpu().numpy().flatten()
-        
-        if self.dimension == 3:
-            z_ic = colloc_IC[2].detach().cpu().numpy().flatten()
-            # Use points near z=middle for 2D slice
-            zmid = (zmin + zmax) / 2.0
-            z_tolerance = 0.1 * (zmax - zmin)  # 10% of domain
-            mask_z = np.abs(z_ic - zmid) < z_tolerance
-            if mask_z.sum() < 100:
-                mask_z = np.ones(len(z_ic), dtype=bool)
-        else:
-            mask_z = np.ones(len(x_ic), dtype=bool)
-        
-        # Create regular grid for FFT
-        # Get actual domain bounds
-        xmin, xmax, ymin, ymax, zmin, zmax = self._get_domain_bounds(model, self.dimension)
-        
-        x_grid = np.linspace(xmin, xmax, n_grid)
-        y_grid = np.linspace(ymin, ymax, n_grid)
-        X_grid, Y_grid = np.meshgrid(x_grid, y_grid, indexing='ij')
-        
-        # Interpolate from scattered IC points to regular grid
-        from scipy.interpolate import griddata
-        points_ic = np.column_stack([x_ic[mask_z], y_ic[mask_z]])
-        points_grid = np.column_stack([X_grid.flatten(), Y_grid.flatten()])
-        
-        # Interpolate density
-        rho_pred_grid = griddata(points_ic, rho_pred[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        rho_true_grid = griddata(points_ic, rho_true[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        
-        # Interpolate velocities
-        vx_pred_grid = griddata(points_ic, vx_pred[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        vy_pred_grid = griddata(points_ic, vy_pred[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        
-        vx_true_grid = griddata(points_ic, vx_true[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        vy_true_grid = griddata(points_ic, vy_true[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        
-        if self.dimension == 3:
-            vz_pred_grid = griddata(points_ic, vz_pred[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-            vz_true_grid = griddata(points_ic, vz_true[mask_z], points_grid, method='linear', fill_value=0).reshape(n_grid, n_grid)
-        
-        # Compute power spectra with correct domain spacing
-        def compute_power_spectrum(field):
-            fft = np.fft.fft2(field)
-            power = np.abs(np.fft.fftshift(fft))**2
-            
-            Lx = xmax - xmin
-            Ly = ymax - ymin
-            dx = Lx / n_grid
-            dy = Ly / n_grid
-            kx = 2 * np.pi * np.fft.fftfreq(n_grid, d=dx)
-            ky = 2 * np.pi * np.fft.fftfreq(n_grid, d=dy)
-            kx_shift = np.fft.fftshift(kx)
-            ky_shift = np.fft.fftshift(ky)
-            KX, KY = np.meshgrid(kx_shift, ky_shift, indexing='ij')
-            K = np.sqrt(KX**2 + KY**2)
-            
-            return power, K
-        
-        power_rho_pred, K = compute_power_spectrum(rho_pred_grid)
-        power_rho_true, _ = compute_power_spectrum(rho_true_grid)
-        
-        power_vx_pred, _ = compute_power_spectrum(vx_pred_grid)
-        power_vx_true, _ = compute_power_spectrum(vx_true_grid)
-        
-        power_vy_pred, _ = compute_power_spectrum(vy_pred_grid)
-        power_vy_true, _ = compute_power_spectrum(vy_true_grid)
-        
-        result = {
-            'K': K,
-            'power_rho_pred': power_rho_pred,
-            'power_rho_true': power_rho_true,
-            'power_vx_pred': power_vx_pred,
-            'power_vx_true': power_vx_true,
-            'power_vy_pred': power_vy_pred,
-            'power_vy_true': power_vy_true,
-        }
-        
-        if self.dimension == 3:
-            power_vz_pred, _ = compute_power_spectrum(vz_pred_grid)
-            power_vz_true, _ = compute_power_spectrum(vz_true_grid)
-            result['power_vz_pred'] = power_vz_pred
-            result['power_vz_true'] = power_vz_true
-        
-        return result
+    )
     
-    def plot_field_spectrum_comparison(self, ps_data):
-        """
-        Plot field spectrum comparison for sinusoidal cases.
-        Shows density and velocity spectra.
-        """
-        if self.dimension == 3:
-            fig = plt.figure(figsize=(18, 5))
-            gs = GridSpec(1, 4, figure=fig)
-            components = [('rho', 'Density'), ('vx', 'X-Velocity'), ('vy', 'Y-Velocity'), ('vz', 'Z-Velocity')]
-        else:
-            fig = plt.figure(figsize=(14, 5))
-            gs = GridSpec(1, 3, figure=fig)
-            components = [('rho', 'Density'), ('vx', 'X-Velocity'), ('vy', 'Y-Velocity')]
-        
-        for idx, (comp, label) in enumerate(components):
-            ax = fig.add_subplot(gs[0, idx])
-            
-            # Radial binning
-            K = ps_data['K']
-            power_pred = ps_data[f'power_{comp}_pred']
-            power_true = ps_data[f'power_{comp}_true']
-            
-            k_max = np.max(K)
-            k_bins = np.linspace(0, k_max, 30)
-            power_pred_avg = []
-            power_true_avg = []
-            k_centers = []
-            
-            for i in range(len(k_bins)-1):
-                mask = (K >= k_bins[i]) & (K < k_bins[i+1])
-                if mask.any():
-                    power_pred_avg.append(np.mean(power_pred[mask]))
-                    power_true_avg.append(np.mean(power_true[mask]))
-                    k_centers.append((k_bins[i] + k_bins[i+1]) / 2)
-            
-            if len(k_centers) > 0:
-                ax.loglog(k_centers, power_true_avg, 'r-', linewidth=2.5, label='True IC', marker='o', markersize=4)
-                ax.loglog(k_centers, power_pred_avg, 'b--', linewidth=2.5, label='Predicted', marker='s', markersize=4)
-                
-                ax.set_xlabel('Wavenumber k', fontsize=11)
-                ax.set_ylabel('Power', fontsize=11)
-                ax.set_title(f'{label} Spectrum', fontsize=12, fontweight='bold')
-                ax.legend(fontsize=10)
-                ax.grid(True, alpha=0.3, which='both')
-        
-        plt.suptitle('IC Field Spectrum: Predicted vs True', fontsize=14, fontweight='bold', y=0.98)
-        plt.tight_layout()
-        plt.savefig(f'{self.save_dir}/ic_power_spectrum.png', dpi=150, bbox_inches='tight')
-        plt.close()
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        required=True,
+        help="Path to saved model (.pth file)"
+    )
+    
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="./diagnostics/",
+        help="Output directory for diagnostic plots (default: ./diagnostics/)"
+    )
+    
+    parser.add_argument(
+        "--tmax", "-t",
+        type=float,
+        default=None,
+        help="Maximum time for analysis (default: from config.py)"
+    )
+    
+    parser.add_argument(
+        "--dimension", "-d",
+        type=int,
+        choices=[2, 3],
+        default=None,
+        help="Spatial dimension override (default: from config.py)"
+    )
+    
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["cuda", "cpu"],
+        default=None,
+        help="Force device (default: auto-detect)"
+    )
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point for standalone diagnostics."""
+    args = parse_args()
+    
+    # Determine device
+    if args.device is not None:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Get tmax from config if not specified
+    if args.tmax is None:
+        from config import tmax as config_tmax
+        tmax = config_tmax
+    else:
+        tmax = args.tmax
+    
+    # Get dimension from config if not specified
+    if args.dimension is None:
+        from config import DIMENSION
+        dimension = DIMENSION
+    else:
+        dimension = args.dimension
+    
+    # Get perturbation type for diagnostics
+    from config import PERTURBATION_TYPE
+    
+    print("\n" + "="*70)
+    print("  PINN Diagnostic Tool - Standalone Mode")
+    print("="*70)
+    print(f"  Model: {args.model}")
+    print(f"  Output: {args.output}")
+    print(f"  tmax: {tmax}")
+    print(f"  Dimension: {dimension}D")
+    print(f"  Perturbation: {PERTURBATION_TYPE}")
+    print("="*70 + "\n")
+    
+    # Load model
+    net = load_model_for_diagnostics(
+        model_path=args.model,
+        device=device,
+        dimension=dimension
+    )
+    
+    # Create diagnostics instance
+    diagnostics = TrainingDiagnostics(
+        save_dir=args.output,
+        dimension=dimension,
+        perturbation_type=PERTURBATION_TYPE
+    )
+    
+    # Run comprehensive diagnostics
+    diagnostics.run_comprehensive_diagnostics(
+        model=net,
+        dimension=dimension,
+        tmax=tmax
+    )
+    
+    print("\nDiagnostics completed successfully!")
+
+
+if __name__ == "__main__":
+    main()
