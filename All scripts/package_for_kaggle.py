@@ -1,131 +1,174 @@
-"""Bundle the modular codebase into a single Kaggle-friendly script.
+"""Build a single-file Kaggle runner from the modular codebase.
 
-Running this script produces ``kaggle_script.py`` which contains the
-combined source code for all internal modules followed by ``train.py``.
-The generated file can be uploaded to Kaggle (together with ``config.py``)
-without needing the original folder structure.
+The generated script (`kaggle_script.py`) embeds project modules and executes
+`train.main()` directly in Kaggle without requiring the original folder tree.
 """
-from __future__ import annotations
 
-import ast
 from pathlib import Path
-from typing import List, Tuple
 
 
 ROOT = Path(__file__).parent
 OUTPUT_FILE = ROOT / "kaggle_script.py"
 
-PACKAGE_NAMES = [
-    "core",
-    "methods",
-    "numerical_solvers",
-    "training",
-    "utilities",
-    "visualization",
+# Core execution order (dependency-aware). Additional modules discovered under
+# project packages are appended afterwards in deterministic order.
+PRIORITY_MODULES = [
+    "config",
+    "core.device",
+    "core.data_generator",
+    "numerical_solvers.LAX",
+    "numerical_solvers.LAX_torch",
+    "core.initial_conditions",
+    "core.losses",
+    "core.model_architecture",
+    "methods.adaptive_collocation",
+    "methods.temporal_splitting",
+    "training.training_diagnostics",
+    "training.physics",
+    "training.trainer",
+    "visualization.plot_utils",
+    "visualization.plot_fields",
+    "visualization.plot_comparisons",
+    "visualization.plot_animations",
+    "visualization.Plotting",
+    "visualization.Interactive",
+    "train",
 ]
 
-# Order matters: parents before dependants so imports succeed in the packed file.
-MODULE_SPECS: List[Tuple[str, str]] = [
-    ("core/data_generator.py", "core.data_generator"),
-    ("numerical_solvers/LAX.py", "numerical_solvers.LAX"),
-    ("numerical_solvers/LAX_torch.py", "numerical_solvers.LAX_torch"),
-    ("core/initial_conditions.py", "core.initial_conditions"),
-    ("core/losses.py", "core.losses"),
-    ("core/model_architecture.py", "core.model_architecture"),
-    ("training/training_diagnostics.py", "training.training_diagnostics"),
-    ("training/physics.py", "training.physics"),
-    ("training/trainer.py", "training.trainer"),
-    ("visualization/Plotting.py", "visualization.Plotting"),
-    ("visualization/Interactive.py", "visualization.Interactive"),
-    ("train.py", "train"),
-]
+# Only runtime-critical packages for train.py are bundled.
+PACKAGE_DIRS = ["core", "methods", "numerical_solvers", "training", "visualization"]
 
 
-def _collect_defined_names(path: Path) -> List[str]:
-    """Return top-level symbol names defined in ``path`` for module registration."""
-    source = path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(path))
-    names = set()
+def _module_name_from_path(path: Path) -> str:
+    rel = path.relative_to(ROOT).as_posix()
+    if rel.endswith("/__init__.py"):
+        return rel[: -len("/__init__.py")].replace("/", ".")
+    return rel[: -len(".py")].replace("/", ".")
 
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
 
-    return sorted(names)
+def _iter_project_modules():
+    for package_dir in PACKAGE_DIRS:
+        package_path = ROOT / package_dir
+        if not package_path.exists():
+            continue
+        for path in sorted(package_path.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            yield path
+
+
+def _ordered_module_specs():
+    discovered = {}
+
+    for root_file in ["config.py", "train.py"]:
+        p = ROOT / root_file
+        if p.exists():
+            discovered[_module_name_from_path(p)] = p
+
+    for path in _iter_project_modules():
+        discovered[_module_name_from_path(path)] = path
+
+    ordered = []
+    used = set()
+
+    for module_name in PRIORITY_MODULES:
+        path = discovered.get(module_name)
+        if path is not None:
+            ordered.append((module_name, path))
+            used.add(module_name)
+
+    for module_name in sorted(discovered):
+        if module_name in used:
+            continue
+        ordered.append((module_name, discovered[module_name]))
+
+    return ordered
 
 
 def build_kaggle_script() -> str:
-    header_lines = [
+    module_specs = _ordered_module_specs()
+    module_names = [name for name, _ in module_specs]
+
+    module_source_entries = []
+    for module_name, path in module_specs:
+        source = path.read_text(encoding="utf-8")
+        module_source_entries.append(f"    {module_name!r}: {source!r},")
+
+    lines = [
         "# Auto-generated by package_for_kaggle.py",
-        "# Do not edit manually; regenerate from the modular codebase instead.",
+        "# Regenerate this file after any code changes.",
         "import sys",
         "import types",
         "",
-        "def _register_module(module_name, attr_names):",
-        "    module = types.ModuleType(module_name)",
-        "    module.__package__ = module_name",
-        "    for attr in attr_names:",
-        "        if attr in globals():",
-        "            module.__dict__[attr] = globals()[attr]",
-        "    sys.modules[module_name] = module",
+        "MODULE_ORDER = [",
+    ]
+    lines.extend([f"    {name!r}," for name in module_names])
+    lines.extend([
+        "]",
+        "",
+        "MODULE_SOURCES = {",
+    ])
+    lines.extend(module_source_entries)
+    lines.extend([
+        "}",
+        "",
+        "def _ensure_parent_packages(module_name):",
         "    parts = module_name.split('.')",
         "    for i in range(1, len(parts)):",
         "        parent_name = '.'.join(parts[:i])",
-        "        if parent_name not in sys.modules:",
-        "            parent_module = types.ModuleType(parent_name)",
-        "            parent_module.__package__ = parent_name",
-        "            parent_module.__path__ = []",
-        "            sys.modules[parent_name] = parent_module",
+        "        child_name = parts[i]",
+        "        parent = sys.modules.get(parent_name)",
+        "        if parent is None:",
+        "            parent = types.ModuleType(parent_name)",
+        "            parent.__package__ = parent_name",
+        "            parent.__path__ = []",
+        "            parent.__file__ = f'<packed:{parent_name}>'",
+        "            sys.modules[parent_name] = parent",
         "            if i == 1:",
-        "                globals()[parts[0]] = parent_module",
-        "    if len(parts) > 1:",
-        "        parent = sys.modules['.'.join(parts[:-1])]",
-        "        setattr(parent, parts[-1], module)",
-        "        module.__package__ = parent.__name__",
-        "    else:",
-        "        globals()[parts[0]] = module",
-        "    if '__path__' not in module.__dict__:",
+        "                globals()[parts[0]] = parent",
+        "        next_parent_name = '.'.join(parts[:i+1])",
+        "        child_mod = sys.modules.get(next_parent_name)",
+        "        if child_mod is not None and not hasattr(parent, child_name):",
+        "            setattr(parent, child_name, child_mod)",
+        "",
+        "def _create_module(module_name):",
+        "    if module_name in sys.modules:",
+        "        return sys.modules[module_name]",
+        "    _ensure_parent_packages(module_name)",
+        "    module = types.ModuleType(module_name)",
+        "    module.__file__ = f'<packed:{module_name}>'",
+        "    parent_name = module_name.rpartition('.')[0]",
+        "    module.__package__ = parent_name if parent_name else module_name",
+        "    if module_name in MODULE_SOURCES and module_name.count('.') == 0 and module_name not in ('config', 'train'):",
         "        module.__path__ = []",
+        "    sys.modules[module_name] = module",
+        "    if parent_name:",
+        "        setattr(sys.modules[parent_name], module_name.split('.')[-1], module)",
+        "    else:",
+        "        globals()[module_name] = module",
         "    return module",
         "",
-    ]
-
-    for package_name in PACKAGE_NAMES:
-        header_lines.extend([
-            f"if '{package_name}' not in sys.modules:",
-            f"    {package_name}_module = types.ModuleType('{package_name}')",
-            f"    {package_name}_module.__package__ = '{package_name}'",
-            f"    {package_name}_module.__path__ = []",
-            f"    sys.modules['{package_name}'] = {package_name}_module",
-            f"    globals()['{package_name}'] = {package_name}_module",
-            "",
-        ])
-
-    body_lines: List[str] = header_lines.copy()
-
-    for rel_path, module_name in MODULE_SPECS:
-        path = ROOT / rel_path
-        if not path.exists():
-            raise FileNotFoundError(f"Required module not found: {rel_path}")
-
-        module_source = path.read_text(encoding="utf-8").rstrip()
-        defined_names = _collect_defined_names(path)
-
-        body_lines.append(f"# ==== Module: {module_name} ({rel_path}) ====")
-        body_lines.append(module_source)
-        attr_list = ", ".join(repr(name) for name in defined_names)
-        body_lines.append(
-            f"_register_module({module_name!r}, [{attr_list}])"
-        )
-        body_lines.append("")
-
-    return "\n".join(body_lines) + "\n"
+        "def _load_all_modules():",
+        "    for module_name in MODULE_ORDER:",
+        "        _create_module(module_name)",
+        "    for module_name in MODULE_ORDER:",
+        "        module = sys.modules[module_name]",
+        "        source = MODULE_SOURCES[module_name]",
+        "        code = compile(source, module.__file__, 'exec')",
+        "        exec(code, module.__dict__)",
+        "",
+        "def main(argv=None):",
+        "    _load_all_modules()",
+        "    train_module = sys.modules['train']",
+        "    if argv is None:",
+        "        argv = sys.argv[1:]",
+        "    train_module.main(argv)",
+        "",
+        "if __name__ == '__main__':",
+        "    main()",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 def main() -> None:

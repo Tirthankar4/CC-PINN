@@ -33,8 +33,9 @@ def get_activation(activation_type):
         raise ValueError(f"Unknown activation type: {activation_type}. Choose from 'sin', 'tanh', 'relu', 'elu'.")
 
 class PINN(nn.Module):
-    def __init__(self, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
+    def __init__(self, dimension, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=1, activation_type=DEFAULT_ACTIVATION):
         super(PINN, self).__init__()
+        self.dimension = dimension
         self.num_neurons = num_neurons
         self.n_harmonics = n_harmonics
         self.num_layers = max(2, int(num_layers))  # total Linear layers including output
@@ -65,18 +66,33 @@ class PINN(nn.Module):
             layers.append(nn.Linear(self.num_neurons, out_dim))
             return nn.Sequential(*layers)
 
-    # 1D branch (periodic x features + t)
-        in_dim_1d = 2*self.n_harmonics + 1
-        self.branch_1d = _make_branch(in_dim_1d, 3)
+    # Build only the branch matching the dimension
+        if dimension == 1:
+            # 1D: periodic x features + t → [rho, vx, phi]
+            in_dim = 2*self.n_harmonics + 1
+            out_dim = 3
+        elif dimension == 2:
+            # 2D: periodic x,y features + t → [rho, vx, vy, phi]
+            in_dim = 4*self.n_harmonics + 1
+            out_dim = 4
+        elif dimension == 3:
+            # 3D: periodic x,y,z features + t → [rho, vx, vy, vz, phi]
+            in_dim = 6*self.n_harmonics + 1
+            out_dim = 5
+        else:
+            raise ValueError(f"Invalid dimension: {dimension}. Expected 1, 2, or 3.")
         
-    # 2D branch (periodic x,y features + t)
-        in_dim_2d = 4*self.n_harmonics + 1
-        self.branch_2d = _make_branch(in_dim_2d, 4)
-        
-    # 3D branch (periodic x,y,z features + t)
-        in_dim_3d = 6*self.n_harmonics + 1
-        self.branch_3d = _make_branch(in_dim_3d, 5)
+        self.branch = _make_branch(in_dim, out_dim)
 
+    # Apply Xavier uniform initialization to all Linear layers
+        self.apply(PINN._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        """Apply Xavier uniform initialization to Linear layers."""
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            m.bias.data.fill_(0.01)
 
     def set_domain(self, rmin, rmax, dimension):
         # rmin/rmax exclude time; follow ASTPN usage
@@ -228,19 +244,11 @@ class PINN(nn.Module):
         """
         features, t, dimension = self._prepare_coordinate_features(X)
         
-        # Select appropriate branch based on dimension
-        if dimension == 2:
-            outputs = self.branch_1d(features)
-        elif dimension == 3:
-            outputs = self.branch_2d(features)
-        elif dimension == 4:
-            outputs = self.branch_3d(features)
-        else:
-            raise ValueError(f"Unexpected dimension: {dimension}")
+        # Verify dimension matches construction
+        if dimension != len(X):
+            raise ValueError(f"Input dimension mismatch: expected {self.dimension + 1} coordinates, got {len(X)}")
+        
+        # Forward pass through the single branch
+        outputs = self.branch(features)
         
         return self._apply_density_constraint(outputs, t)
-        
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight)
-        m.bias.data.fill_(0.01)

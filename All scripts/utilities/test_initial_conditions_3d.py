@@ -146,7 +146,7 @@ def test_2d_backward_compatibility():
     print(f"[OK] Dimension detection: {dim}")
     
     # Test shared fields initialization (2D)
-    vx_np, vy_np = initialize_shared_velocity_fields(
+    vx_np, vy_np, _ = initialize_shared_velocity_fields(
         lam, num_of_waves, v_1, seed=RANDOM_SEED, dimension=2
     )
     assert vx_np is not None and vy_np is not None, "Shared fields not initialized"
@@ -204,7 +204,7 @@ def test_3d_functionality():
     print(f"[OK] Dimension detection: {dim}")
     
     # Test shared fields initialization (3D)
-    vx_np, vy_np, vz_np = initialize_shared_velocity_fields(
+    vx_np, vy_np, vz_np, _ = initialize_shared_velocity_fields(
         lam, num_of_waves, v_1, seed=RANDOM_SEED, dimension=3
     )
     assert vx_np is not None and vy_np is not None and vz_np is not None, "Shared fields not initialized"

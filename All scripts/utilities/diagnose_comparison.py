@@ -64,7 +64,7 @@ def main():
     shared_vy_np = None
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         v_1 = a * cs
-        shared_vx_np, shared_vy_np = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
+        shared_vx_np, shared_vy_np, _ = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
         set_shared_velocity_fields(shared_vx_np, shared_vy_np)
     
     initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)

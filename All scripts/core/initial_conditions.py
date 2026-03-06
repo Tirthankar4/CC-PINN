@@ -16,15 +16,20 @@ Functions:
 
 import numpy as np
 import torch
+from dataclasses import dataclass
+from typing import Optional, Callable
 from config import (cs, rho_o, N_GRID, POWER_EXPONENT, 
                     PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED,
                     DIMENSION, N_GRID_3D)
 from numerical_solvers.LAX import generate_shared_velocity_field
 
-# Global shared velocity fields for consistent initial conditions
-_shared_vx_interp = None
-_shared_vy_interp = None
-_shared_vz_interp = None
+
+@dataclass
+class VelocityFieldInterpolators:
+    """Container for velocity field interpolation functions."""
+    vx_interp: Callable
+    vy_interp: Callable
+    vz_interp: Optional[Callable] = None  # None for 2D cases
 
 def _ensure_column_tensor(tensor):
     return tensor if tensor.dim() > 1 else tensor.unsqueeze(-1)
@@ -76,11 +81,9 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None, dimensi
         dimension: Spatial dimension (2 or 3). If None, uses DIMENSION from config.
     
     Returns:
-        For 2D: Tuple (vx_np, vy_np): Velocity field arrays
-        For 3D: Tuple (vx_np, vy_np, vz_np): Velocity field arrays
+        For 2D: Tuple (vx_np, vy_np, interpolators: VelocityFieldInterpolators)
+        For 3D: Tuple (vx_np, vy_np, vz_np, interpolators: VelocityFieldInterpolators)
     """
-    global _shared_vx_interp, _shared_vy_interp, _shared_vz_interp
-    
     if seed is None:
         seed = RANDOM_SEED
     
@@ -107,12 +110,9 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None, dimensi
             random_seed=seed
         )
         
-        # Store interpolation functions globally
-        _shared_vx_interp = vx_interp
-        _shared_vy_interp = vy_interp
-        _shared_vz_interp = None
-        
-        return vx_np, vy_np
+        # Return arrays and interpolators (no global state)
+        interpolators = VelocityFieldInterpolators(vx_interp, vy_interp)
+        return vx_np, vy_np, interpolators
     
     elif dimension == 3:
         # 3D case - use N_GRID_3D for all dimensions for consistency
@@ -130,12 +130,9 @@ def initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=None, dimensi
             Lz=Lz
         )
         
-        # Store interpolation functions globally
-        _shared_vx_interp = vx_interp
-        _shared_vy_interp = vy_interp
-        _shared_vz_interp = vz_interp
-        
-        return vx_np, vy_np, vz_np
+        # Return arrays and interpolators (no global state)
+        interpolators = VelocityFieldInterpolators(vx_interp, vy_interp, vz_interp)
+        return vx_np, vy_np, vz_np, interpolators
     
     else:
         raise ValueError(f"Unsupported dimension={dimension}. Use 2 or 3.")
@@ -180,237 +177,97 @@ def _interpolate_shared_field(x, field_interp):
     else:
         return field_tensor
 
-
-def _generate_power_spectrum_fallback(lam, v_1, x, seed=None):
+def generate_power_spectrum_field(lam, v_1, x, seed=None, interpolators=None):
     """
-    Fallback power spectrum generation when shared fields are not available.
-    Supports both 2D and 3D FFT.
-    
-    Args:
-        lam: Wavelength (unused for domain sizing in fallback)
-        v_1: Velocity amplitude
-        x: Collocation coordinates [x, y, ...] for 2D or [x, y, z, ...] for 3D
-        seed: Random seed
-    
-    Returns:
-        Generated power spectrum field
-    """
-    if seed is None:
-        seed = RANDOM_SEED
-    
-    # Detect dimension from coordinates
-    dim = _detect_dimension(x)
-    
-    # Infer domain extents directly from the collocation coordinates to support arbitrary num_of_waves
-    # Use conservative defaults if tensors are degenerate (e.g., single point during a unit test)
-    x_coords = x[0].detach()
-    y_coords = x[1].detach() if len(x) > 1 else x[0].detach()
-    z_coords = x[2].detach() if len(x) > 2 and dim == 3 else None
-
-    xmin_val = torch.min(x_coords).item() if x_coords.numel() > 0 else 0.0
-    xmax_val = torch.max(x_coords).item() if x_coords.numel() > 0 else float(lam * 2.0)
-    ymin_val = torch.min(y_coords).item() if y_coords.numel() > 0 else 0.0
-    ymax_val = torch.max(y_coords).item() if y_coords.numel() > 0 else float(lam * 2.0)
-    
-    if dim == 3 and z_coords is not None:
-        zmin_val = torch.min(z_coords).item() if z_coords.numel() > 0 else 0.0
-        zmax_val = torch.max(z_coords).item() if z_coords.numel() > 0 else float(lam * 2.0)
-    else:
-        zmin_val = 0.0
-        zmax_val = float(lam * 2.0)
-
-    # Ensure positive lengths; fall back to 2*lam if bounds collapse
-    Lx = float(max(xmax_val - xmin_val, 1e-6))
-    Ly = float(max(ymax_val - ymin_val, 1e-6))
-    Lz = float(max(zmax_val - zmin_val, 1e-6)) if dim == 3 else None
-    
-    if not torch.isfinite(torch.tensor(Lx)) or Lx < 1e-6:
-        Lx = float(lam * 2.0)
-    if not torch.isfinite(torch.tensor(Ly)) or Ly < 1e-6:
-        Ly = float(lam * 2.0)
-    if dim == 3 and (Lz is None or not torch.isfinite(torch.tensor(Lz)) or Lz < 1e-6):
-        Lz = float(lam * 2.0)
-
-    # Select grid size based on dimension
-    if dim == 2:
-        nx, ny = N_GRID, N_GRID
-        nz = None
-        dx = Lx / nx
-        dy = Ly / ny
-        dz = None
-    else:  # dim == 3
-        # Use N_GRID_3D for all dimensions in 3D for consistency
-        nx, ny, nz = N_GRID_3D, N_GRID_3D, N_GRID_3D
-        dx = Lx / nx
-        dy = Ly / ny
-        dz = Lz / nz
-    
-    # Calculate wave numbers
-    kx = 2 * np.pi * torch.fft.fftfreq(nx, dx, device=x[0].device)
-    ky = 2 * np.pi * torch.fft.fftfreq(ny, dy, device=x[0].device)
-    
-    if dim == 2:
-        KX_grid, KY_grid = torch.meshgrid(kx, ky, indexing='ij')
-        
-        # Calculate magnitude of wave number
-        K = torch.sqrt(KX_grid**2 + KY_grid**2)
-        
-        # Power spectrum: P(k) ~ k^expon
-        K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
-        power_spectrum = K_safe**POWER_EXPONENT
-        
-        # Remove DC (uniform) mode to avoid bulk drift
-        power_spectrum[K == 0] = 0.0
-        
-        # Safety check: limit extreme values
-        power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
-        
-        # Generate random phases
-        torch.manual_seed(seed)
-        random_phases = torch.randn(nx, ny, device=x[0].device) + 1j * torch.randn(nx, ny, device=x[0].device)
-        
-        # Create complex field in Fourier space and transform to real space
-        field_fourier = torch.sqrt(power_spectrum) * random_phases
-        field_real = torch.real(torch.fft.ifft2(field_fourier))
-        
-        # Remove any residual mean (bulk flow) and normalize rms to v_1
-        field_real = field_real - torch.mean(field_real)
-        field_real = field_real / torch.std(field_real) * v_1
-        
-        # Interpolate to the actual collocation points
-        x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (nx - 1), 0, nx - 1)
-        if len(x) > 1:
-            y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (ny - 1), 0, ny - 1)
-        else:
-            # 1D fallback: mirror x for y to preserve shape
-            y_norm = x_norm.clone()
-        
-        x_idx = torch.round(x_norm).long()
-        y_idx = torch.round(y_norm).long()
-        
-        # Ensure correct tensor shape [N, 1]
-        result = field_real[x_idx, y_idx]
-        if result.dim() == 1:
-            return result.unsqueeze(-1)
-        else:
-            return result
-    
-    else:  # dim == 3
-        kz = 2 * np.pi * torch.fft.fftfreq(nz, dz, device=x[0].device)
-        KX_grid, KY_grid, KZ_grid = torch.meshgrid(kx, ky, kz, indexing='ij')
-        
-        # Calculate magnitude of wave number
-        K = torch.sqrt(KX_grid**2 + KY_grid**2 + KZ_grid**2)
-        
-        # Power spectrum: P(k) ~ k^expon
-        K_safe = torch.where(K == 0, torch.tensor(1e-10, device=x[0].device), K)
-        power_spectrum = K_safe**POWER_EXPONENT
-        
-        # Remove DC (uniform) mode to avoid bulk drift
-        power_spectrum[K == 0] = 0.0
-        
-        # Safety check: limit extreme values
-        power_spectrum = torch.clamp(power_spectrum, 0, 1e6)
-        
-        # Generate random phases
-        torch.manual_seed(seed)
-        random_phases = torch.randn(nx, ny, nz, device=x[0].device) + 1j * torch.randn(nx, ny, nz, device=x[0].device)
-        
-        # Create complex field in Fourier space and transform to real space
-        field_fourier = torch.sqrt(power_spectrum) * random_phases
-        field_real = torch.real(torch.fft.ifftn(field_fourier))
-        
-        # Remove any residual mean (bulk flow) and normalize rms to v_1
-        field_real = field_real - torch.mean(field_real)
-        field_real = field_real / torch.std(field_real) * v_1
-        
-        # Interpolate to the actual collocation points
-        x_norm = torch.clamp(((x[0] - xmin_val) / Lx) * (nx - 1), 0, nx - 1)
-        y_norm = torch.clamp(((x[1] - ymin_val) / Ly) * (ny - 1), 0, ny - 1)
-        z_norm = torch.clamp(((x[2] - zmin_val) / Lz) * (nz - 1), 0, nz - 1)
-        
-        x_idx = torch.round(x_norm).long()
-        y_idx = torch.round(y_norm).long()
-        z_idx = torch.round(z_norm).long()
-        
-        # Ensure correct tensor shape [N, 1]
-        result = field_real[x_idx, y_idx, z_idx]
-        if result.dim() == 1:
-            return result.unsqueeze(-1)
-        else:
-            return result
-
-
-def generate_power_spectrum_field(lam, v_1, x, seed=None):
-    """
-    Generate 2D Gaussian random field with power spectrum using shared fields if available.
+    Generate vx component using interpolators.
     
     Args:
         lam: Wavelength
         v_1: Velocity amplitude
         x: Collocation coordinates [x, y, ...]
         seed: Random seed for reproducibility
+        interpolators: VelocityFieldInterpolators instance (required for power spectrum ICs)
     
     Returns:
         vx component of velocity field
+        
+    Raises:
+        ValueError: If interpolators are not provided for power spectrum perturbations
     """
     if seed is None:
         seed = RANDOM_SEED
     
-    # Use shared velocity fields if available
-    if _shared_vx_interp is not None:
-        return _interpolate_shared_field(x, _shared_vx_interp)
+    # Use interpolators if provided
+    if interpolators is not None and interpolators.vx_interp is not None:
+        return _interpolate_shared_field(x, interpolators.vx_interp)
     
-    # Fallback to original method if shared fields not available
-    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
+    # Error if interpolators not provided - ensures PINN/LAX consistency
+    raise ValueError(
+        "VelocityFieldInterpolators required for power spectrum initial conditions. "
+        "Call initialize_shared_velocity_fields() first and pass the returned interpolators."
+    )
 
 
-def generate_power_spectrum_field_vy(lam, v_1, x, seed=None):
+def generate_power_spectrum_field_vy(lam, v_1, x, seed=None, interpolators=None):
     """
-    Generate vy component using shared fields if available.
+    Generate vy component using interpolators.
     
     Args:
         lam: Wavelength
         v_1: Velocity amplitude
         x: Collocation coordinates [x, y, ...] for 2D or [x, y, z, ...] for 3D
         seed: Random seed for reproducibility
+        interpolators: VelocityFieldInterpolators instance (required for power spectrum ICs)
     
     Returns:
         vy component of velocity field
+        
+    Raises:
+        ValueError: If interpolators are not provided for power spectrum perturbations
     """
     if seed is None:
         seed = RANDOM_SEED
     
-    # Use shared velocity fields if available
-    if _shared_vy_interp is not None:
-        return _interpolate_shared_field(x, _shared_vy_interp)
+    # Use interpolators if provided
+    if interpolators is not None and interpolators.vy_interp is not None:
+        return _interpolate_shared_field(x, interpolators.vy_interp)
     
-    # Fallback to original method if shared fields not available
-    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
+    # Error if interpolators not provided - ensures PINN/LAX consistency
+    raise ValueError(
+        "VelocityFieldInterpolators required for power spectrum initial conditions. "
+        "Call initialize_shared_velocity_fields() first and pass the returned interpolators."
+    )
 
 
-def generate_power_spectrum_field_vz(lam, v_1, x, seed=None):
+def generate_power_spectrum_field_vz(lam, v_1, x, seed=None, interpolators=None):
     """
-    Generate vz component using shared fields if available.
+    Generate vz component using interpolators.
     
     Args:
         lam: Wavelength
         v_1: Velocity amplitude
         x: Collocation coordinates [x, y, z, ...] for 3D
         seed: Random seed for reproducibility
+        interpolators: VelocityFieldInterpolators instance (required for power spectrum ICs)
     
     Returns:
         vz component of velocity field
+        
+    Raises:
+        ValueError: If interpolators are not provided for power spectrum perturbations
     """
     if seed is None:
         seed = RANDOM_SEED
     
-    # Use shared velocity fields if available
-    if _shared_vz_interp is not None:
-        return _interpolate_shared_field(x, _shared_vz_interp)
+    # Use interpolators if provided
+    if interpolators is not None and interpolators.vz_interp is not None:
+        return _interpolate_shared_field(x, interpolators.vz_interp)
     
-    # Fallback to original method if shared fields not available
-    return _generate_power_spectrum_fallback(lam, v_1, x, seed)
+    # Error if interpolators not provided - ensures PINN/LAX consistency
+    raise ValueError(
+        "VelocityFieldInterpolators required for power spectrum initial conditions. "
+        "Call initialize_shared_velocity_fields() first and pass the returned interpolators."
+    )
 
 
 def _compute_wave_phase(spatial_coords, lam):
@@ -497,7 +354,7 @@ def fun_rho_0(rho_1, lam, x):
     return rho_0
 
 
-def fun_vx_0(lam, jeans, v_1, x):
+def fun_vx_0(lam, jeans, v_1, x, interpolators=None):
     """
     Initial condition for x-velocity.
     
@@ -506,6 +363,7 @@ def fun_vx_0(lam, jeans, v_1, x):
         jeans: Jeans length
         v_1: Velocity amplitude
         x: Spatial coordinates
+        interpolators: VelocityFieldInterpolators (required for power spectrum perturbations)
     
     Returns:
         vx_0: Initial x-velocity field
@@ -514,11 +372,11 @@ def fun_vx_0(lam, jeans, v_1, x):
         vx, _, _ = _coupled_velocity_components(x, lam, jeans, v_1)
         return vx
     else:
-        # Power spectrum case
-        return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED)
+        # Power spectrum case - pass interpolators through
+        return generate_power_spectrum_field(lam, v_1, x, seed=RANDOM_SEED, interpolators=interpolators)
 
 
-def fun_vy_0(lam, jeans, v_1, x):
+def fun_vy_0(lam, jeans, v_1, x, interpolators=None):
     """
     Initial condition for y-velocity.
     
@@ -527,6 +385,7 @@ def fun_vy_0(lam, jeans, v_1, x):
         jeans: Jeans length
         v_1: Velocity amplitude
         x: Spatial coordinates
+        interpolators: VelocityFieldInterpolators (required for power spectrum perturbations)
     
     Returns:
         vy_0: Initial y-velocity field
@@ -535,11 +394,11 @@ def fun_vy_0(lam, jeans, v_1, x):
         _, vy, _ = _coupled_velocity_components(x, lam, jeans, v_1)
         return vy
     else:
-        # Power spectrum case
-        return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED)
+        # Power spectrum case - pass interpolators through
+        return generate_power_spectrum_field_vy(lam, v_1, x, seed=RANDOM_SEED, interpolators=interpolators)
 
 
-def fun_vz_0(lam, jeans, v_1, x):
+def fun_vz_0(lam, jeans, v_1, x, interpolators=None):
     """
     Initial condition for z-velocity (used in 3D runs).
     
@@ -548,6 +407,7 @@ def fun_vz_0(lam, jeans, v_1, x):
         jeans: Jeans length
         v_1: Velocity amplitude
         x: Spatial coordinates
+        interpolators: VelocityFieldInterpolators (required for power spectrum perturbations)
     
     Returns:
         vz_0: Initial z-velocity field
@@ -556,8 +416,8 @@ def fun_vz_0(lam, jeans, v_1, x):
         _, _, vz = _coupled_velocity_components(x, lam, jeans, v_1)
         return vz
     else:
-        # Power spectrum case: use shared fields or fallback
-        return generate_power_spectrum_field_vz(lam, v_1, x, seed=RANDOM_SEED)
+        # Power spectrum case - pass interpolators through
+        return generate_power_spectrum_field_vz(lam, v_1, x, seed=RANDOM_SEED, interpolators=interpolators)
 
 
 def func(x):

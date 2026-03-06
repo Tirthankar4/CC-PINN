@@ -62,11 +62,7 @@ from core.data_generator import input_taker, req_consts_calc
 from core.initial_conditions import initialize_shared_velocity_fields
 from visualization.Plotting import set_shared_velocity_fields, create_density_growth_plot
 import visualization.Plotting as plotting_module
-from numerical_solvers.LAX import (
-    lax_solution,
-    lax_solution_3d_sinusoidal,
-    lax_solution1D_sinusoidal,
-)
+from numerical_solvers.LAX import lax_solver
 from numerical_solvers.LAX_torch import (
     lax_solver_torch,
 )
@@ -80,6 +76,123 @@ device = "mps" if torch.backends.mps.is_built() else "cuda:0" if torch.cuda.is_a
 
 if device.startswith('cuda'):
     torch.cuda.empty_cache()
+
+
+def lax_solution(time, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False,
+                 comparison=False, animation=None, use_velocity_ps=False, ps_index=-3.0,
+                 vel_rms=0.02, random_seed=None, vx0_shared=None, vy0_shared=None):
+    """
+    Backward-compatible local wrapper that maps legacy 2D API to unified lax_solver().
+    """
+    _ = animation  # Kept for compatibility with old call sites.
+    Lx = Ly = lam * num_of_waves
+    domain_params = {'Lx': Lx, 'Ly': Ly, 'nx': int(N), 'ny': int(N)}
+    physics_params = {
+        'c_s': cs,
+        'rho_o': rho_o,
+        'const': const,
+        'G': G,
+        'rho_1': rho_1,
+        'lam': lam
+    }
+
+    use_power_spectrum = use_velocity_ps or (vx0_shared is not None and vy0_shared is not None)
+    if use_power_spectrum:
+        ic_type = 'power_spectrum'
+        ic_params = {
+            'power_index': ps_index,
+            'amplitude': vel_rms,
+            'random_seed': random_seed,
+            'vx0_shared': vx0_shared,
+            'vy0_shared': vy0_shared
+        }
+    else:
+        ic_type = 'sinusoidal'
+        ic_params = {'KX': KX, 'KY': KY}
+
+    options = {'gravity': gravity, 'nu': nu, 'comparison': comparison, 'isplot': isplot}
+    result = lax_solver(time, domain_params, physics_params, ic_type=ic_type, ic_params=ic_params, options=options)
+
+    x = result.coordinates['x']
+    rho = np.asarray(result.density)
+    vx, vy = [np.asarray(v) for v in result.velocity_components]
+    phi = np.asarray(result.potential) if result.potential is not None else np.zeros_like(rho)
+    n_iter = int(result.metadata.get('iterations', 0))
+    rho_max = float(result.metadata.get('rho_max', np.max(rho)))
+    return x, rho, vx, vy, phi, n_iter, rho_max
+
+
+def lax_solution_3d_sinusoidal(time, N, nu, lam, num_of_waves, rho_1, gravity=True,
+                               use_velocity_ps=False, ps_index=-3.0, vel_rms=0.02,
+                               random_seed=None, vx0_shared=None, vy0_shared=None, vz0_shared=None):
+    """
+    Backward-compatible local wrapper that maps legacy 3D API to unified lax_solver().
+    """
+    Lx = Ly = Lz = lam * num_of_waves
+    domain_params = {'Lx': Lx, 'Ly': Ly, 'Lz': Lz, 'nx': int(N), 'ny': int(N), 'nz': int(N)}
+    physics_params = {
+        'c_s': cs,
+        'rho_o': rho_o,
+        'const': const,
+        'G': G,
+        'rho_1': rho_1,
+        'lam': lam
+    }
+
+    if use_velocity_ps:
+        ic_type = 'power_spectrum'
+        ic_params = {
+            'power_index': ps_index,
+            'amplitude': vel_rms,
+            'random_seed': random_seed,
+            'vx0_shared': vx0_shared,
+            'vy0_shared': vy0_shared,
+            'vz0_shared': vz0_shared
+        }
+    else:
+        ic_type = 'sinusoidal'
+        ic_params = {'KX': KX, 'KY': KY, 'KZ': 0.0}
+
+    options = {'gravity': gravity, 'nu': nu, 'comparison': False, 'isplot': False}
+    result = lax_solver(time, domain_params, physics_params, ic_type=ic_type, ic_params=ic_params, options=options)
+
+    x = result.coordinates['x']
+    y = result.coordinates['y']
+    z = result.coordinates['z']
+    rho = np.asarray(result.density)
+    vx, vy, vz = [np.asarray(v) for v in result.velocity_components]
+    phi = np.asarray(result.potential) if result.potential is not None else np.zeros_like(rho)
+    n_iter = int(result.metadata.get('iterations', 0))
+    rho_max = float(result.metadata.get('rho_max', np.max(rho)))
+    return x, y, z, rho, vx, vy, vz, phi, n_iter, rho_max
+
+
+def lax_solution1D_sinusoidal(time, N, nu, lam, num_of_waves, rho_1, gravity=False,
+                              isplot=None, comparison=None, animation=None):
+    """
+    Backward-compatible local wrapper that maps legacy 1D API to unified lax_solver().
+    """
+    _ = (isplot, comparison, animation)  # Kept for compatibility with old call sites.
+    Lx = lam * num_of_waves
+    domain_params = {'Lx': Lx, 'nx': int(N)}
+    physics_params = {
+        'c_s': cs,
+        'rho_o': rho_o,
+        'const': const,
+        'G': G,
+        'rho_1': rho_1,
+        'lam': lam
+    }
+    options = {'gravity': gravity, 'nu': nu, 'comparison': False, 'isplot': False}
+    result = lax_solver(time, domain_params, physics_params, ic_type='sinusoidal', ic_params={}, options=options)
+
+    x = result.coordinates['x']
+    rho = np.asarray(result.density)
+    vx = np.asarray(result.velocity_components[0])
+    phi = np.asarray(result.potential) if result.potential is not None else np.zeros_like(rho)
+    n_iter = int(result.metadata.get('iterations', 0))
+    rho_max = float(result.metadata.get('rho_max', np.max(rho)))
+    return x, rho, vx, phi, n_iter, rho_max
 
 
 class FDSolutionManager:
@@ -323,7 +436,7 @@ def load_model(model_path, xmax, ymax, zmax=None):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
     
-    net = PINN(n_harmonics=harmonics)
+    net = PINN(dimension=DIMENSION, n_harmonics=harmonics)
     net.load_state_dict(torch.load(model_path, map_location=device))
     rmin = [xmin]
     rmax = [xmax]
@@ -1485,13 +1598,13 @@ def main():
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         v_1 = a * cs
         result = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
-        if len(result) == 3:
-            # 3D case
-            shared_vx_np, shared_vy_np, shared_vz_np = result
+        if len(result) == 4:
+            # 3D case: vx, vy, vz, interpolators
+            shared_vx_np, shared_vy_np, shared_vz_np, _ = result
             set_shared_velocity_fields(shared_vx_np, shared_vy_np, shared_vz_np)
-        else:
-            # 2D case
-            shared_vx_np, shared_vy_np = result
+        elif len(result) == 3:
+            # 2D case: vx, vy, interpolators
+            shared_vx_np, shared_vy_np, _ = result
             set_shared_velocity_fields(shared_vx_np, shared_vy_np)
     
     initial_params = (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)

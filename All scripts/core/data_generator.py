@@ -89,12 +89,11 @@ class col_gen(object):
         return tensor
         
         
-    def geo_time_coord(self,option,coordinate=1):
+    def geo_time_coord(self, option, coordinate=1):
         '''
         option: Takes arguments: "Domain", "BC" for Boundary conditions, "IC" for initial conditions:
         
         '''
-        
         if self.dimension == 1: 
             if option == "Domain":
                 x_coor = self._generate_uniform_tensor(self.N_r, self.rmin[0], self.rmax[0])
@@ -254,51 +253,3 @@ def req_consts_calc(lam, rho_1):
             alpha = np.sqrt(cs**2*(2*np.pi/lam)**2 - const*G*(rho_o + 1))
 
     return jeans, alpha
-
-
-
-
-def generate_poisson_ic_points(rmin, rmax, n_points, dimension=2, device='cuda'):
-    """
-    Generate extra collocation points at t=0 specifically for enforcing Poisson equation.
-    
-    This implements Option 3: Pure ML approach to fix initial phi by sampling many
-    spatial points at t=0 where Poisson equation ∇²φ = const*(ρ-ρ₀) must be satisfied.
-    
-    Args:
-        rmin: List of minimum values [xmin, ymin, (zmin), tmin]
-        rmax: List of maximum values [xmax, ymax, (zmax), tmax]
-        n_points: Number of spatial points to generate at t=0
-        dimension: Spatial dimension (1, 2, or 3)
-        device: PyTorch device ('cuda' or 'cpu')
-    
-    Returns:
-        List of tensors [x, y, (z), t] where t=0 everywhere, or None if n_points == 0
-    """
-    import torch
-    
-    # Return None if no points requested (avoids empty tensor issues)
-    if n_points <= 0:
-        return None
-    
-    coor = []
-    
-    if dimension == 1:
-        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
-        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
-        coor = [x_ic, t_ic]
-    
-    elif dimension == 2:
-        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
-        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
-        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
-        coor = [x_ic, y_ic, t_ic]
-    
-    elif dimension == 3:
-        x_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[0], rmax[0]).requires_grad_()
-        y_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[1], rmax[1]).requires_grad_()
-        z_ic = torch.empty(n_points, 1, device=device, dtype=torch.float32).uniform_(rmin[2], rmax[2]).requires_grad_()
-        t_ic = torch.zeros(n_points, 1, device=device, dtype=torch.float32).requires_grad_()
-        coor = [x_ic, y_ic, z_ic, t_ic]
-    
-    return coor

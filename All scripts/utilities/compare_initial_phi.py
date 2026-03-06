@@ -43,7 +43,7 @@ def load_model(model_path, xmax, ymax):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
     
-    net = PINN(n_harmonics=harmonics)
+    net = PINN(dimension=DIMENSION, n_harmonics=harmonics)
     net.load_state_dict(torch.load(model_path, map_location=device))
     net.set_domain(rmin=[xmin, ymin], rmax=[xmax, ymax], dimension=DIMENSION)
     net = net.to(device)
@@ -94,7 +94,7 @@ def create_initial_phi_comparison(net, model_path, N=400, nu=0.5):
     shared_vy = None
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         v_1 = a * cs
-        shared_vx, shared_vy = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
+        shared_vx, shared_vy, _ = initialize_shared_velocity_fields(lam, num_of_waves, v_1, seed=RANDOM_SEED)
         plotting_module.set_shared_velocity_fields(shared_vx, shared_vy)
         print(f"  Initialized shared velocity fields for power spectrum")
     

@@ -219,7 +219,7 @@ def pinn_vs_fd_mse(
         rho_ic = rho_o * np.ones((grid_n, grid_n), dtype=np.float64)
 
         # Use same shared velocity fields as training
-        vx_shared, vy_shared = initialize_shared_velocity_fields(
+        vx_shared, vy_shared, _ = initialize_shared_velocity_fields(
             lam, num_of_waves, v_1, seed=None
         )
         if vx_shared.shape != rho_ic.shape:
@@ -526,7 +526,7 @@ def plot_field_panels(
 
 
 def load_model(path: str, lam: float, num_waves: float, device: torch.device) -> PINN:
-    net = PINN(n_harmonics=harmonics)
+    net = PINN(dimension=DIMENSION, n_harmonics=harmonics)
     xmax = xmin + lam * num_waves
     if DIMENSION >= 2:
         ymax = ymin + lam * num_waves

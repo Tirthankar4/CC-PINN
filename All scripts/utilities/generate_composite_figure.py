@@ -84,8 +84,9 @@ class Sin(torch.nn.Module):
 
 class PINN(torch.nn.Module):
     """Simplified PINN for loading 2D model."""
-    def __init__(self, num_neurons=64, num_layers=5, n_harmonics=3):
+    def __init__(self, dimension, num_neurons=64, num_layers=5, n_harmonics=3):
         super().__init__()
+        self.dimension = dimension
         self.num_neurons = num_neurons
         self.n_harmonics = n_harmonics
         self.num_layers = max(2, int(num_layers))
@@ -104,14 +105,20 @@ class PINN(torch.nn.Module):
             layers.append(torch.nn.Linear(self.num_neurons, out_dim))
             return torch.nn.Sequential(*layers)
         
-        in_dim_1d = 2*self.n_harmonics + 1
-        self.branch_1d = _make_branch(in_dim_1d, 3)
+        # Build only the branch matching the dimension
+        if dimension == 1:
+            in_dim = 2*self.n_harmonics + 1
+            out_dim = 3
+        elif dimension == 2:
+            in_dim = 4*self.n_harmonics + 1
+            out_dim = 4
+        elif dimension == 3:
+            in_dim = 6*self.n_harmonics + 1
+            out_dim = 5
+        else:
+            raise ValueError(f"Invalid dimension: {dimension}")
         
-        in_dim_2d = 4*self.n_harmonics + 1
-        self.branch_2d = _make_branch(in_dim_2d, 4)
-        
-        in_dim_3d = 6*self.n_harmonics + 1
-        self.branch_3d = _make_branch(in_dim_3d, 5)
+        self.branch = _make_branch(in_dim, out_dim)
     
     def set_domain(self, rmin, rmax, dimension):
         if dimension >= 1:
@@ -141,7 +148,7 @@ class PINN(torch.nn.Module):
         y_feat = self._periodic_features(y, self.ymin, self.ymax)
         features = torch.cat([x_feat, y_feat, t], dim=1)
         
-        outputs = self.branch_2d(features)
+        outputs = self.branch(features)
         
         # Apply density constraint (simplified)
         rho_hat = outputs[:, 0:1]
@@ -302,7 +309,7 @@ def main():
     print("Loading model...")
     model_path = r"C:\Users\tirth\OneDrive\Desktop\gravitational collapse results\2D power spectrum\model.pth"
     
-    model = PINN(num_neurons=num_neurons, num_layers=num_layers, n_harmonics=harmonics)
+    model = PINN(dimension=2, num_neurons=num_neurons, num_layers=num_layers, n_harmonics=harmonics)
     # The trained model is for DIMENSION=2 (2D spatial: x, y + time)
     model.set_domain([xmin, ymin], [xmax, ymax], dimension=2)  # spatial dimension = 2
     

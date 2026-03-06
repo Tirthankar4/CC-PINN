@@ -7,6 +7,44 @@ from matplotlib.gridspec import GridSpec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+def _compute_ic_component_losses(net, collocation_IC, rho_1, lam, jeans, v_1, dimension, mse_cost_function):
+    """
+    Compute individual IC component losses for 3D power spectrum diagnostics.
+    
+    Returns:
+        Dict with component-wise losses: {'rho', 'vx', 'vy', 'vz', 'phi'}
+    """
+    from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
+    from config import rho_o
+    
+    with torch.no_grad():
+        # Get true ICs
+        rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
+        vx_0 = fun_vx_0(lam, jeans, v_1, collocation_IC)
+        vy_0 = fun_vy_0(lam, jeans, v_1, collocation_IC)
+        vz_0 = fun_vz_0(lam, jeans, v_1, collocation_IC)
+        
+        # Get predictions
+        net_ic_out = net(collocation_IC)
+        rho_ic_out = net_ic_out[:, 0:1]
+        vx_ic_out = net_ic_out[:, 1:2]
+        vy_ic_out = net_ic_out[:, 2:3]
+        vz_ic_out = net_ic_out[:, 3:4]
+        phi_ic_out = net_ic_out[:, 4:5]
+        
+        # Compute component losses
+        ic_losses = {
+            'rho': mse_cost_function(rho_ic_out, rho_0).item(),
+            'vx': mse_cost_function(vx_ic_out, vx_0).item(),
+            'vy': mse_cost_function(vy_ic_out, vy_0).item(),
+            'vz': mse_cost_function(vz_ic_out, vz_0).item(),
+            'phi': torch.mean(phi_ic_out ** 2).item(),  # phi should be close to 0 ideally
+        }
+    
+    return ic_losses
+
+
 class TrainingDiagnostics:
     """
     Comprehensive diagnostics for PINN performance analysis.
@@ -28,6 +66,9 @@ class TrainingDiagnostics:
         self.dimension = dimension
         self.perturbation_type = str(perturbation_type).lower()
         
+        # Track if this is 3D power spectrum case (for specialized IC diagnostics)
+        self.is_3d_power_spectrum = (dimension == 3 and self.perturbation_type == 'power_spectrum')
+        
         os.makedirs(save_dir, exist_ok=True)
 
         # Storage for tracking metrics over iterations
@@ -47,7 +88,7 @@ class TrainingDiagnostics:
         # Single tensor [N, D] -> list of [N,1]
         return [geomtime_col[:, i:i+1] for i in range(geomtime_col.shape[1])]
 
-    def log_iteration(self, iteration, model, loss_dict, geomtime_col):
+    def log_iteration(self, iteration, model, loss_dict, geomtime_col, ic_component_losses=None):
         """
         Call this every N iterations during training.
         
@@ -56,6 +97,7 @@ class TrainingDiagnostics:
             model: PINN model
             loss_dict: Dictionary with 'total', 'PDE', 'IC' losses
             geomtime_col: Collocation points
+            ic_component_losses: Optional dict with IC component losses for 3D power spectrum diagnostics
         """
         self.history['iteration'].append(iteration)
         self.history['total_loss'].append(float(loss_dict.get('total', np.nan)))
@@ -1377,6 +1419,22 @@ class TrainingDiagnostics:
         print("  4. temporal_error_accumulation.png - Error growth and compounding")
         print("  5. spectral_bias_analysis.png - Frequency damping and spectral issues")
         print("="*70 + "\n")
+    
+    def run_unified_diagnostics(self, model, true_ic_data, final_iteration):
+        """
+        Generate unified training diagnostics plot (for all cases).
+        
+        This is called at the end of training to generate the final diagnostic plot
+        showing loss convergence and balance.
+        
+        Args:
+            model: Trained PINN model
+            true_ic_data: Dictionary with true IC data for comparison (optional, not used currently)
+            final_iteration: Final iteration number for labeling
+        """
+        # Simply generate the training diagnostics plot
+        self.plot_diagnostics(iteration=final_iteration)
+        print(f"      [OK] Training diagnostics plot saved to {self.save_dir}")
 
 
 # ==================== STANDALONE EXECUTION MODE ====================
@@ -1407,7 +1465,7 @@ def load_model_for_diagnostics(model_path, device='cuda', dimension=None):
     zmax = zmin + lam * num_of_waves
     
     # Create PINN with correct architecture
-    net = PINN(n_harmonics=harmonics)
+    net = PINN(dimension=dimension, n_harmonics=harmonics)
     
     # Set domain bounds for periodic features
     if dimension == 1:

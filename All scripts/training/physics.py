@@ -1,167 +1,13 @@
 import numpy as np
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
-from core.losses import ASTPN, pde_residue
-from training.training_diagnostics import TrainingDiagnostics
-from core.data_generator import diff
-from core.model_architecture import PINN
-from core.initial_conditions import (initialize_shared_velocity_fields, generate_power_spectrum_field, 
-                                    generate_power_spectrum_field_vy, fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0)
-from config import cs, const, G, rho_o, PERTURBATION_TYPE, KX, KY, BATCH_SIZE, NUM_BATCHES, RANDOM_SEED
-from config import IC_WEIGHT, ENABLE_TRAINING_DIAGNOSTICS
+from core.losses import pde_residue
+from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
+from config import rho_o, PERTURBATION_TYPE, KX, KY
 
 
 # ==================== Physics Calculations and Loss Functions ====================
 
-def closure(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer, rho_1, lam, jeans, v_1, data_terms=None):
-
-    ############## Loss based on initial conditions ###############
-    rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
-    vx_0  = fun_vx_0(lam, jeans, v_1, collocation_IC)
-
-    if model.dimension == 2:
-        vy_0  = fun_vy_0(lam, jeans, v_1, collocation_IC)
-
-    elif model.dimension == 3:
-        vy_0  = fun_vy_0(lam, jeans, v_1, collocation_IC)
-        vz_0  = fun_vz_0(lam, jeans, v_1, collocation_IC)
-    
-    net_ic_out = net(collocation_IC)
-
-    rho_ic_out = net_ic_out[:,0:1]
-    vx_ic_out  = net_ic_out[:,1:2]
-
-    if model.dimension == 2:
-        vy_ic_out  = net_ic_out[:,2:3]
-    elif model.dimension == 3:
-        vy_ic_out  = net_ic_out[:,2:3]
-        vz_ic_out  = net_ic_out[:,3:4]
-
-    # For sinusoidal: enforce only explicit sinusoidal ICs; skip continuity seeding
-    is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
-    if is_sin:
-        x_ic_for_ic = collocation_IC[0]
-        if len(collocation_IC) >= 2:  # 2D case
-            y_ic_for_ic = collocation_IC[1]
-            rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic_for_ic + KY * y_ic_for_ic)
-        else:  # 1D case
-            rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
-        mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
-    else:
-        mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
-
-    mse_vx_ic  =  mse_cost_function(vx_ic_out, vx_0)
-
-    if model.dimension == 2:
-        mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
-
-    elif model.dimension == 3:
-        mse_vy_ic  =  mse_cost_function(vy_ic_out, vy_0)
-        mse_vz_ic  =  mse_cost_function(vz_ic_out, vz_0)
-
-    ############## Loss based on PDE ###################################
-    
-    # Apply startup time offset to PDE collocation time only (IC remains at t=0)
-    if isinstance(collocation_domain, (list, tuple)):
-        colloc_shifted = list(collocation_domain)
-    else:
-        # Single tensor format: split into [x, y, t]
-        colloc_shifted = [collocation_domain[:, i:i+1] for i in range(collocation_domain.shape[1])]
-
-    if model.dimension == 1:
-        # time is at index 1
-        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,phi_r = pde_residue(colloc_shifted, net, dimension = 1)
-
-    elif model.dimension == 2:
-        # time is at index 2
-        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,vy_r,phi_r = pde_residue(colloc_shifted, net, dimension = 2)
-
-    elif model.dimension == 3:
-        # time is at index 3
-        # Note: Domain collocation points now start from STARTUP_DT (set in data_generator.py)
-        rho_r,vx_r,vy_r,vz_r,phi_r = pde_residue(colloc_shifted, net, dimension = 3)
-    
-
-    mse_rho  = torch.mean(rho_r ** 2)
-    mse_velx = torch.mean(vx_r  ** 2)
-
-    if model.dimension == 2:
-        mse_vely = torch.mean(vy_r  ** 2)
-
-    elif model.dimension == 3:
-        mse_vely = torch.mean(vy_r  ** 2)
-        mse_velz = torch.mean(vz_r  ** 2)
-    
-    mse_phi  = torch.mean(phi_r ** 2)
-
-    ic_weight = IC_WEIGHT
-
-    ################### Combining the loss functions ####################
-    if model.dimension == 1:
-        base = ic_weight * mse_vx_ic + mse_rho + mse_velx + mse_phi
-        loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-
-    elif model.dimension == 2:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic) + mse_rho + mse_velx + mse_vely + mse_phi
-        loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-
-    elif model.dimension == 3:
-        base = ic_weight * (mse_vx_ic + mse_vy_ic + mse_vz_ic) + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
-        loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-
-    
-        #loss = mse_rho_ic + mse_vx_ic + mse_vy_ic + mse_vz_ic + \
-        #rhox_b + rhoy_b + rhoz_b + vx_xb + vx_yb + vx_zb +  vy_xb + vy_yb + vy_zb + vz_xb + vz_yb + vz_zb + \
-        #phi_xb + phi_xx_b + phi_yb + phi_yy_b +  phi_zb + phi_zz_b + mse_rho + mse_velx +  mse_vely + mse_velz + mse_phi 
-
-    data_loss_tensor, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms if data_terms else [])
-    if data_loss_tensor is not None:
-        loss = loss + data_loss_tensor
-
-    optimizer.zero_grad()
-    loss.backward()
-    
-    # Apply gradient clipping for training stability
-    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-    
-    # Create loss breakdown dictionary
-    loss_breakdown = {}
-    
-    # IC losses (grouped together)
-    ic_loss = mse_vx_ic.item()
-    if isinstance(mse_rho_ic, torch.Tensor) and mse_rho_ic.item() > 0:
-        ic_loss += mse_rho_ic.item()
-    
-    if model.dimension == 2:
-        ic_loss += mse_vy_ic.item()
-    elif model.dimension == 3:
-        ic_loss += mse_vy_ic.item()
-        ic_loss += mse_vz_ic.item()
-    
-    loss_breakdown['IC'] = ic_loss
-    
-    # PDE losses (grouped together)
-    pde_loss = mse_rho.item() + mse_velx.item()
-    
-    if model.dimension == 2:
-        pde_loss += mse_vely.item()
-    elif model.dimension == 3:
-        pde_loss += mse_vely.item()
-        pde_loss += mse_velz.item()
-    
-    pde_loss += mse_phi.item()
-    loss_breakdown['PDE'] = pde_loss
-
-    if data_loss_tensor is not None:
-        for label, value in data_breakdown.items():
-            loss_breakdown[label] = value
-
-    return loss, loss_breakdown
 
 def _random_batch_indices(total_count, batch_size, device):
     actual = int(min(batch_size, total_count))
@@ -198,6 +44,7 @@ def _sample_data_term(dataset, batch_size):
         'rho': _slice('rho'),
         'vx': _slice('vx'),
         'vy': _slice('vy'),
+        'vz': _slice('vz'),
         'phi': _slice('phi'),
     }
 
@@ -216,12 +63,14 @@ def _compute_data_loss_unweighted(net, batch, mse_cost_function):
     outputs = net(inputs)
     num_outputs = outputs.shape[1]
 
-    component_specs = [
-        ('rho', 0),
-        ('vx', 1),
-        ('vy', 2),
-        ('phi', 3),
-    ]
+    if num_outputs == 3:  # 1D: [rho, vx, phi]
+        component_specs = [('rho', 0), ('vx', 1), ('phi', 2)]
+    elif num_outputs == 4:  # 2D: [rho, vx, vy, phi]
+        component_specs = [('rho', 0), ('vx', 1), ('vy', 2), ('phi', 3)]
+    elif num_outputs >= 5:  # 3D: [rho, vx, vy, vz, phi, ...]
+        component_specs = [('rho', 0), ('vx', 1), ('vy', 2), ('vz', 3), ('phi', 4)]
+    else:
+        return None
 
     losses = []
     for key, idx in component_specs:
@@ -260,441 +109,367 @@ def _evaluate_data_terms(net, mse_cost_function, data_terms):
     return total_loss, breakdown
 
 
-def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
-                    rho_1, lam, jeans, v_1, batch_size, num_batches, update_tracker=True, iteration=0, use_fft_poisson=None, data_terms=None, collocation_poisson_ic=None):
+# ==================== Shared batch-level physics (inner loop body) ====================
+
+def _compute_ic_losses(net, batch_ic, model, rho_1, lam, jeans, v_1, mse_cost_function, interpolators=None):
     """
-    Batched closure function for training with proper gradient accumulation.
+    Compute initial condition losses for density and velocity components.
     
-    This function computes losses over mini-batches and accumulates gradients
-    (not tensors) to maintain constant memory usage regardless of num_batches.
+    Returns:
+        Dict with MSE losses for each IC component
     """
-    # Determine counts and devices
-    # Handle both formats: list of tensors [x, y, t] or single tensor [N, 3]
+    # Get true IC values
+    rho_0 = fun_rho_0(rho_1, lam, batch_ic)
+    vx_0 = fun_vx_0(lam, jeans, v_1, batch_ic, interpolators=interpolators)
+    
+    # Network predictions at t=0
+    net_ic_out = net(batch_ic)
+    rho_ic_out = net_ic_out[:, 0:1]
+    vx_ic_out = net_ic_out[:, 1:2]
+    
+    # Dimension-specific velocity components
+    if model.dimension == 2:
+        vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic, interpolators=interpolators)
+        vy_ic_out = net_ic_out[:, 2:3]
+    elif model.dimension == 3:
+        vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic, interpolators=interpolators)
+        vz_0 = fun_vz_0(lam, jeans, v_1, batch_ic, interpolators=interpolators)
+        vy_ic_out = net_ic_out[:, 2:3]
+        vz_ic_out = net_ic_out[:, 3:4]
+    
+    # Density IC loss (only for sinusoidal perturbations)
+    is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
+    if is_sin:
+        x_ic = batch_ic[0]
+        if model.dimension >= 2:
+            y_ic = batch_ic[1]
+            rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic + KY * y_ic)
+        else:
+            rho_ic_target = rho_o + rho_1 * torch.cos(2 * np.pi * x_ic / lam)
+        mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
+    else:
+        mse_rho_ic = 0.0 * torch.mean(rho_ic_out * 0)
+    
+    # Velocity IC losses
+    mse_vx_ic = mse_cost_function(vx_ic_out, vx_0)
+    
+    if model.dimension == 2:
+        mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
+        mse_vz_ic = None
+    elif model.dimension == 3:
+        mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
+        mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
+    else:
+        mse_vy_ic = None
+        mse_vz_ic = None
+    
+    return {
+        'mse_rho_ic': mse_rho_ic,
+        'mse_vx_ic': mse_vx_ic,
+        'mse_vy_ic': mse_vy_ic,
+        'mse_vz_ic': mse_vz_ic,
+    }
+
+
+def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
+    """
+    Compute PDE residual losses for all equations (continuity, momentum, Poisson).
+    
+    Returns:
+        Dict with MSE losses for each PDE component
+    """
+    # Ensure batch_dom is in list format for pde_residue
+    colloc_shifted = list(batch_dom) if isinstance(batch_dom, (list, tuple)) else \
+                     [batch_dom[:, i:i+1] for i in range(batch_dom.shape[1])]
+    
+    # Compute PDE residuals (dimension-specific returns)
+    if model.dimension == 1:
+        rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
+        vy_r = vz_r = None
+    elif model.dimension == 2:
+        rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
+        vz_r = None
+    else:  # dimension == 3
+        rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
+    
+    # Convert residuals to MSE losses
+    mse_rho = torch.mean(rho_r ** 2)
+    mse_velx = torch.mean(vx_r ** 2)
+    mse_phi = torch.mean(phi_r ** 2)
+    
+    mse_vely = torch.mean(vy_r ** 2) if vy_r is not None else None
+    mse_velz = torch.mean(vz_r ** 2) if vz_r is not None else None
+    
+    return {
+        'mse_rho': mse_rho,
+        'mse_velx': mse_velx,
+        'mse_vely': mse_vely,
+        'mse_velz': mse_velz,
+        'mse_phi': mse_phi,
+    }
+
+
+def _aggregate_losses(ic_losses, pde_losses, model):
+    """
+    Aggregate IC and PDE losses into total loss based on dimension.
+    
+    Returns:
+        Total loss tensor
+    """
+    # Density IC term (0 for power spectrum)
+    rho_ic_term = ic_losses['mse_rho_ic'] if isinstance(ic_losses['mse_rho_ic'], torch.Tensor) else 0.0
+    
+    # Base losses (all dimensions)
+    loss = ic_losses['mse_vx_ic'] + pde_losses['mse_rho'] + pde_losses['mse_velx'] + pde_losses['mse_phi'] + rho_ic_term
+    
+    # Add dimension-specific components
+    if model.dimension >= 2:
+        loss = loss + ic_losses['mse_vy_ic'] + pde_losses['mse_vely']
+    if model.dimension == 3:
+        loss = loss + ic_losses['mse_vz_ic'] + pde_losses['mse_velz']
+    
+    return loss
+
+
+def _compute_single_batch_losses(net, mse_cost_function, batch_dom, batch_ic,
+                                  model, rho_1, lam, jeans, v_1,
+                                  num_effective_batches, data_terms, interpolators=None):
+    """
+    Computes IC loss + PDE residuals + loss aggregation for one mini-batch,
+    immediately calls scaled_loss.backward(), and returns scalar tracking values.
+
+    Shared by both closure_batched (Adam) and closure_batched_cached (L-BFGS).
+    The only thing that differs between those two closures is *how* batch_dom
+    and batch_ic were obtained (fresh random indices vs cached indices).
+
+    Returns a dict of plain Python floats suitable for logging/breakdown, plus
+    the unscaled scalar loss value for this batch.
+    """
+    # Compute IC losses
+    ic_losses = _compute_ic_losses(net, batch_ic, model, rho_1, lam, jeans, v_1, mse_cost_function, interpolators)
+    
+    # Compute PDE losses
+    pde_losses = _compute_pde_losses(net, batch_dom, model, mse_cost_function)
+    
+    # Aggregate into total loss
+    loss = _aggregate_losses(ic_losses, pde_losses, model)
+    
+    # Add optional supervised data terms
+    data_breakdown = {}
+    if data_terms:
+        data_loss_batch, data_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms)
+        if data_loss_batch is not None:
+            loss = loss + data_loss_batch
+
+    # Backward pass (gradient accumulation — graph freed immediately)
+    scaled_loss = loss / num_effective_batches
+    scaled_loss.backward()
+
+    # Collect scalar tracking values (detached, no graph refs)
+    scalars = {
+        'loss': loss.item(),
+        'mse_vx_ic': ic_losses['mse_vx_ic'].item(),
+        'mse_rho_ic': ic_losses['mse_rho_ic'].item() if isinstance(ic_losses['mse_rho_ic'], torch.Tensor) else 0.0,
+        'mse_rho': pde_losses['mse_rho'].item(),
+        'mse_velx': pde_losses['mse_velx'].item(),
+        'mse_phi': pde_losses['mse_phi'].item(),
+        'mse_vy_ic': 0.0,
+        'mse_vely': 0.0,
+        'mse_vz_ic': 0.0,
+        'mse_velz': 0.0,
+        'data_breakdown': data_breakdown,
+    }
+    if model.dimension >= 2:
+        scalars['mse_vy_ic'] = ic_losses['mse_vy_ic'].item()
+        scalars['mse_vely'] = pde_losses['mse_vely'].item()
+    if model.dimension == 3:
+        scalars['mse_vz_ic'] = ic_losses['mse_vz_ic'].item()
+        scalars['mse_velz'] = pde_losses['mse_velz'].item()
+
+    return scalars
+
+
+
+def _build_loss_breakdown(last_scalars, model, last_data_breakdown):
+    """
+    Constructs the loss breakdown dict from the scalar values tracked across batches.
+    Shared by both closure variants.
+    """
+    breakdown = {}
+
+    ic_loss = last_scalars['mse_vx_ic']
+    if last_scalars['mse_rho_ic'] > 0:
+        ic_loss += last_scalars['mse_rho_ic']
+    if model.dimension >= 2:
+        ic_loss += last_scalars['mse_vy_ic']
+    if model.dimension == 3:
+        ic_loss += last_scalars['mse_vz_ic']
+    breakdown['IC'] = ic_loss
+
+    pde_loss = last_scalars['mse_rho'] + last_scalars['mse_velx']
+    if model.dimension >= 2:
+        pde_loss += last_scalars['mse_vely']
+    if model.dimension == 3:
+        pde_loss += last_scalars['mse_velz']
+    pde_loss += last_scalars['mse_phi']
+    breakdown['PDE'] = pde_loss
+
+    for label, value in last_data_breakdown.items():
+        breakdown[label] = value
+
+    return breakdown
+
+
+# ==================== Public closure functions ====================
+
+def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
+                    rho_1, lam, jeans, v_1, batch_size, num_batches,
+                    update_tracker=True, iteration=0, use_fft_poisson=None,
+                    data_terms=None, interpolators=None):
+    """
+    Batched closure for Adam.
+
+    Generates fresh random batch indices on every call. Adam only calls the
+    closure once per step, so a shifting loss landscape is fine.
+
+    Gradients are accumulated across mini-batches (not tensors) so peak GPU
+    memory stays constant regardless of num_batches.
+    """
+    # ── Setup ─────────────────────────────────────────────────────────────────
     if isinstance(collocation_domain, (list, tuple)):
-        dom_n = collocation_domain[0].size(0)
+        dom_n  = collocation_domain[0].size(0)
         device = collocation_domain[0].device
     else:
-        dom_n = collocation_domain.size(0)
+        dom_n  = collocation_domain.size(0)
         device = collocation_domain.device
-    
+
     ic_n = collocation_IC[0].size(0)
-    
     num_effective_batches = int(max(1, num_batches))
-    
-    # Zero gradients before accumulation loop
+
     optimizer.zero_grad()
-    
-    # Track scalar losses for logging (not tensors to avoid memory leak)
+
     total_loss_scalar = 0.0
-    last_data_breakdown = {}
-    
-    # Variables to track last batch's breakdown (for logging)
-    last_mse_vx_ic = 0.0
-    last_mse_rho_ic = 0.0
-    last_mse_vy_ic = 0.0
-    last_mse_vz_ic = 0.0
-    last_mse_rho = 0.0
-    last_mse_velx = 0.0
-    last_mse_vely = 0.0
-    last_mse_velz = 0.0
-    last_mse_phi = 0.0
+    scalar_keys = ['mse_vx_ic', 'mse_rho_ic', 'mse_vy_ic', 'mse_vz_ic',
+                   'mse_rho', 'mse_velx', 'mse_vely', 'mse_velz', 'mse_phi']
+    accum_scalars = {k: 0.0 for k in scalar_keys}
+    accum_data_breakdown = {}
 
-    for batch_idx in range(num_effective_batches):
+    # ── Mini-batch loop (fresh random indices each iteration) ─────────────────
+    for _ in range(num_effective_batches):
         dom_idx = _random_batch_indices(dom_n, batch_size, device)
-        ic_idx = _random_batch_indices(ic_n, batch_size, device)
+        ic_idx  = _random_batch_indices(ic_n,  batch_size, device)
 
-        # Handle both formats for collocation_domain
         if isinstance(collocation_domain, (list, tuple)):
             batch_dom = _make_batch_tensors(collocation_domain, dom_idx)
         else:
-            # Single tensor format: split into [x, y, t]
             batch_dom = [collocation_domain[dom_idx, i:i+1] for i in range(collocation_domain.shape[1])]
-        
+
         batch_ic = _make_batch_tensors(collocation_IC, ic_idx)
 
-        # IC loss terms
-        rho_0 = fun_rho_0(rho_1, lam, batch_ic)
-        vx_0  = fun_vx_0(lam, jeans, v_1, batch_ic)
+        scalars = _compute_single_batch_losses(
+            net, mse_cost_function, batch_dom, batch_ic,
+            model, rho_1, lam, jeans, v_1,
+            num_effective_batches, data_terms, interpolators=interpolators
+        )
 
-        net_ic_out = net(batch_ic)
-        rho_ic_out = net_ic_out[:,0:1]
-        vx_ic_out  = net_ic_out[:,1:2]
+        total_loss_scalar += scalars['loss']
+        for key in scalar_keys:
+            accum_scalars[key] += scalars[key]
+        for label, value in scalars['data_breakdown'].items():
+            accum_data_breakdown[label] = accum_data_breakdown.get(label, 0.0) + value
 
-        if model.dimension == 2:
-            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-            vy_ic_out = net_ic_out[:,2:3]
-        elif model.dimension == 3:
-            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-            vz_0 = fun_vz_0(lam, jeans, v_1, batch_ic)
-            vy_ic_out = net_ic_out[:,2:3]
-            vz_ic_out = net_ic_out[:,3:4]
-
-        is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
-        if is_sin:
-            x_ic_for_ic = batch_ic[0]
-            if len(batch_ic) >= 2:
-                y_ic_for_ic = batch_ic[1]
-                rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic_for_ic + KY * y_ic_for_ic)
-            else:
-                rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
-            mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
-        else:
-            mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
-
-        mse_vx_ic  = mse_cost_function(vx_ic_out, vx_0)
-        if model.dimension == 2:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
-        elif model.dimension == 3:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
-            mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
-
-        # PDE residuals on batched domain with startup shift
-        if isinstance(batch_dom, (list, tuple)):
-            colloc_shifted = list(batch_dom)
-        else:
-            # Single tensor format: split into [x, y, t]
-            colloc_shifted = [batch_dom[:, i:i+1] for i in range(batch_dom.shape[1])]
-        if model.dimension == 1:
-            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
-        elif model.dimension == 2:
-            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
-        else:
-            # Note: Domain collocation points already start from STARTUP_DT, no need to shift further
-            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
-
-        # Standard uniform weighting for PDE residuals
-        mse_rho  = torch.mean(rho_r ** 2)
-        mse_velx = torch.mean(vx_r  ** 2)
-        if model.dimension == 2:
-            mse_vely = torch.mean(vy_r  ** 2)
-        elif model.dimension == 3:
-            mse_vely = torch.mean(vy_r  ** 2)
-            mse_velz = torch.mean(vz_r  ** 2)
-        mse_phi  = torch.mean(phi_r ** 2)
-
-        if model.dimension == 1:
-            base = mse_vx_ic + mse_rho + mse_velx + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-        elif model.dimension == 2:
-            base = mse_vx_ic + mse_vy_ic + mse_rho + mse_velx + mse_vely + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-        else:
-            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-
-        if data_terms:
-            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms)
-            if data_loss_batch is not None:
-                loss = loss + data_loss_batch
-                last_data_breakdown = batch_breakdown
-
-        # Scale loss and backward immediately (gradient accumulation)
-        # This frees the computational graph after each batch
-        scaled_loss = loss / num_effective_batches
-        scaled_loss.backward()
-        
-        # Track scalar loss for logging
-        total_loss_scalar += loss.item()
-        
-        # Store last batch values for breakdown (as scalars)
-        last_mse_vx_ic = mse_vx_ic.item()
-        last_mse_rho_ic = mse_rho_ic.item() if isinstance(mse_rho_ic, torch.Tensor) else 0.0
-        last_mse_rho = mse_rho.item()
-        last_mse_velx = mse_velx.item()
-        last_mse_phi = mse_phi.item()
-        if model.dimension >= 2:
-            last_mse_vy_ic = mse_vy_ic.item()
-            last_mse_vely = mse_vely.item()
-        if model.dimension == 3:
-            last_mse_vz_ic = mse_vz_ic.item()
-            last_mse_velz = mse_velz.item()
-    
-    # Add Poisson IC loss (Option 3: Pure ML approach for initial phi)
-    # This enforces Poisson equation at t=0 with extra collocation points
-    # Note: This is added outside the batch loop as it uses separate collocation points
-    mse_poisson_ic = 0.0
-    mse_phi_mean = 0.0
-    if collocation_poisson_ic is not None:
-        from core.losses import poisson_residue_only
-        from config import POISSON_IC_WEIGHT, PHI_MEAN_CONSTRAINT_WEIGHT
-        
-        poisson_loss = torch.tensor(0.0, device=device)
-        
-        # Only compute and add Poisson IC loss if weight is non-zero
-        if POISSON_IC_WEIGHT > 0:
-            # Enforce Poisson equation: ∇²φ = const*(ρ-ρ₀)
-            phi_r_ic = poisson_residue_only(collocation_poisson_ic, net, dimension=model.dimension)
-            mse_poisson_ic = torch.mean(phi_r_ic ** 2)
-            poisson_loss = poisson_loss + POISSON_IC_WEIGHT * mse_poisson_ic
-        
-        # Only compute and add phi mean constraint if weight is non-zero
-        if PHI_MEAN_CONSTRAINT_WEIGHT > 0:
-            # Enforce mean(φ) = 0 at t=0 to fix gauge freedom (Option A)
-            # This removes the arbitrary constant offset in φ
-            net_output_ic = net(collocation_poisson_ic)
-            phi_ic = net_output_ic[:, -1]  # Last output is phi
-            mean_phi = torch.mean(phi_ic)
-            mse_phi_mean = mean_phi ** 2
-            poisson_loss = poisson_loss + PHI_MEAN_CONSTRAINT_WEIGHT * mse_phi_mean
-        
-        # Backward for Poisson IC loss (adds to accumulated gradients)
-        if poisson_loss.requires_grad:
-            poisson_loss.backward()
-            total_loss_scalar += poisson_loss.item()
-
-    # Apply gradient clipping for training stability
+    # ── Gradient clipping ─────────────────────────────────────────────────────
+    # Measure gradient norm before clipping for monitoring
+    grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=float('inf'))
+    # Now actually clip
     torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-    
-    # Create loss breakdown dictionary (from last batch, as approximation)
-    loss_breakdown = {}
-    
-    # IC losses (grouped together)
-    ic_loss = last_mse_vx_ic
-    if last_mse_rho_ic > 0:
-        ic_loss += last_mse_rho_ic
-    
-    if model.dimension == 2:
-        ic_loss += last_mse_vy_ic
-    elif model.dimension == 3:
-        ic_loss += last_mse_vy_ic
-        ic_loss += last_mse_vz_ic
-    
-    loss_breakdown['IC'] = ic_loss
-    
-    # PDE losses (grouped together)
-    pde_loss = last_mse_rho + last_mse_velx
-    
-    if model.dimension == 2:
-        pde_loss += last_mse_vely
-    elif model.dimension == 3:
-        pde_loss += last_mse_vely
-        pde_loss += last_mse_velz
-    
-    pde_loss += last_mse_phi
-    loss_breakdown['PDE'] = pde_loss
-    
-    # Add Poisson IC loss to breakdown if it was computed
-    if isinstance(mse_poisson_ic, torch.Tensor):
-        loss_breakdown['Poisson_IC'] = mse_poisson_ic.item()
-    if isinstance(mse_phi_mean, torch.Tensor):
-        loss_breakdown['Phi_Mean'] = mse_phi_mean.item()
-    
-    for label, value in last_data_breakdown.items():
-        loss_breakdown[label] = value
 
-    # Return average loss as a tensor for compatibility
-    avg_loss = torch.tensor(total_loss_scalar / num_effective_batches, device=device)
+    avg_scalars = {k: v / num_effective_batches for k, v in accum_scalars.items()}
+    avg_data_breakdown = {
+        label: value / num_effective_batches
+        for label, value in accum_data_breakdown.items()
+    }
+
+    loss_breakdown = _build_loss_breakdown(avg_scalars, model, avg_data_breakdown)
+    loss_breakdown['grad_norm'] = grad_norm_before_clip.item()
+
+    avg_loss_scalar = total_loss_scalar / num_effective_batches
+    avg_loss = torch.tensor(avg_loss_scalar, device=device)
     return avg_loss, loss_breakdown
 
 
 def closure_batched_cached(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
                            rho_1, lam, jeans, v_1, batch_size, num_batches,
                            cached_dom_indices, cached_ic_indices,
-                           data_terms=None, collocation_poisson_ic=None):
+                           data_terms=None, interpolators=None):
     """
-    Batched closure function for L-BFGS with cached indices.
-    
-    L-BFGS calls the closure multiple times per step for line search.
-    Using cached indices ensures the loss landscape is consistent across calls,
-    which is critical for L-BFGS convergence.
-    
-    Args:
-        cached_dom_indices: List of pre-generated domain batch indices
-        cached_ic_indices: List of pre-generated IC batch indices
+    Batched closure for L-BFGS.
+
+    L-BFGS performs a line search and calls the closure multiple times per
+    optimizer step. Using pre-generated cached indices ensures the loss
+    landscape is consistent across those calls, which is critical for
+    L-BFGS convergence. Fresh random indices (as in closure_batched) would
+    make the landscape shift between line-search evaluations and break
+    convergence.
     """
-    # Determine device
+    # ── Setup ─────────────────────────────────────────────────────────────────
     if isinstance(collocation_domain, (list, tuple)):
         device = collocation_domain[0].device
     else:
         device = collocation_domain.device
-    
+
     num_effective_batches = len(cached_dom_indices)
-    
-    # Zero gradients before accumulation loop
+
     optimizer.zero_grad()
-    
-    # Track scalar losses for logging
+
     total_loss_scalar = 0.0
-    last_data_breakdown = {}
-    
-    # Variables to track last batch's breakdown
-    last_mse_vx_ic = 0.0
-    last_mse_rho_ic = 0.0
-    last_mse_vy_ic = 0.0
-    last_mse_vz_ic = 0.0
-    last_mse_rho = 0.0
-    last_mse_velx = 0.0
-    last_mse_vely = 0.0
-    last_mse_velz = 0.0
-    last_mse_phi = 0.0
+    scalar_keys = ['mse_vx_ic', 'mse_rho_ic', 'mse_vy_ic', 'mse_vz_ic',
+                   'mse_rho', 'mse_velx', 'mse_vely', 'mse_velz', 'mse_phi']
+    accum_scalars = {k: 0.0 for k in scalar_keys}
+    accum_data_breakdown = {}
 
+    # ── Mini-batch loop (cached indices — consistent across L-BFGS line search) ──
     for batch_idx in range(num_effective_batches):
-        dom_idx = cached_dom_indices[batch_idx]
-        ic_idx = cached_ic_indices[batch_idx]
+        dom_idx  = cached_dom_indices[batch_idx]
+        ic_idx   = cached_ic_indices[batch_idx]
 
-        # Handle both formats for collocation_domain
         if isinstance(collocation_domain, (list, tuple)):
             batch_dom = _make_batch_tensors(collocation_domain, dom_idx)
         else:
             batch_dom = [collocation_domain[dom_idx, i:i+1] for i in range(collocation_domain.shape[1])]
-        
+
         batch_ic = _make_batch_tensors(collocation_IC, ic_idx)
 
-        # IC loss terms
-        rho_0 = fun_rho_0(rho_1, lam, batch_ic)
-        vx_0  = fun_vx_0(lam, jeans, v_1, batch_ic)
+        scalars = _compute_single_batch_losses(
+            net, mse_cost_function, batch_dom, batch_ic,
+            model, rho_1, lam, jeans, v_1,
+            num_effective_batches, data_terms, interpolators=interpolators
+        )
 
-        net_ic_out = net(batch_ic)
-        rho_ic_out = net_ic_out[:,0:1]
-        vx_ic_out  = net_ic_out[:,1:2]
+        total_loss_scalar += scalars['loss']
+        for key in scalar_keys:
+            accum_scalars[key] += scalars[key]
+        for label, value in scalars['data_breakdown'].items():
+            accum_data_breakdown[label] = accum_data_breakdown.get(label, 0.0) + value
 
-        if model.dimension == 2:
-            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-            vy_ic_out = net_ic_out[:,2:3]
-        elif model.dimension == 3:
-            vy_0 = fun_vy_0(lam, jeans, v_1, batch_ic)
-            vz_0 = fun_vz_0(lam, jeans, v_1, batch_ic)
-            vy_ic_out = net_ic_out[:,2:3]
-            vz_ic_out = net_ic_out[:,3:4]
-
-        is_sin = str(PERTURBATION_TYPE).lower() == "sinusoidal"
-        if is_sin:
-            x_ic_for_ic = batch_ic[0]
-            if len(batch_ic) >= 2:
-                y_ic_for_ic = batch_ic[1]
-                rho_ic_target = rho_o + rho_1 * torch.cos(KX * x_ic_for_ic + KY * y_ic_for_ic)
-            else:
-                rho_ic_target = rho_o + rho_1 * torch.cos(2*np.pi*x_ic_for_ic/lam)
-            mse_rho_ic = mse_cost_function(rho_ic_out, rho_ic_target)
-        else:
-            mse_rho_ic = 0.0 * torch.mean(rho_ic_out*0)
-
-        mse_vx_ic  = mse_cost_function(vx_ic_out, vx_0)
-        if model.dimension == 2:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
-        elif model.dimension == 3:
-            mse_vy_ic = mse_cost_function(vy_ic_out, vy_0)
-            mse_vz_ic = mse_cost_function(vz_ic_out, vz_0)
-
-        # PDE residuals
-        if isinstance(batch_dom, (list, tuple)):
-            colloc_shifted = list(batch_dom)
-        else:
-            colloc_shifted = [batch_dom[:, i:i+1] for i in range(batch_dom.shape[1])]
-            
-        if model.dimension == 1:
-            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
-        elif model.dimension == 2:
-            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
-        else:
-            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
-
-        # Standard uniform weighting for PDE residuals
-        mse_rho  = torch.mean(rho_r ** 2)
-        mse_velx = torch.mean(vx_r  ** 2)
-        if model.dimension == 2:
-            mse_vely = torch.mean(vy_r  ** 2)
-        elif model.dimension == 3:
-            mse_vely = torch.mean(vy_r  ** 2)
-            mse_velz = torch.mean(vz_r  ** 2)
-        mse_phi  = torch.mean(phi_r ** 2)
-
-        if model.dimension == 1:
-            base = mse_vx_ic + mse_rho + mse_velx + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-        elif model.dimension == 2:
-            base = mse_vx_ic + mse_vy_ic + mse_rho + mse_velx + mse_vely + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-        else:
-            base = mse_vx_ic + mse_vy_ic + mse_vz_ic + mse_rho + mse_velx + mse_vely + mse_velz + mse_phi
-            loss = base + (mse_rho_ic if isinstance(mse_rho_ic, torch.Tensor) else 0.0)
-
-        if data_terms:
-            data_loss_batch, batch_breakdown = _evaluate_data_terms(net, mse_cost_function, data_terms)
-            if data_loss_batch is not None:
-                loss = loss + data_loss_batch
-                last_data_breakdown = batch_breakdown
-
-        # Scale loss and backward immediately (gradient accumulation)
-        scaled_loss = loss / num_effective_batches
-        scaled_loss.backward()
-        
-        # Track scalar loss for logging
-        total_loss_scalar += loss.item()
-        
-        # Store last batch values for breakdown
-        last_mse_vx_ic = mse_vx_ic.item()
-        last_mse_rho_ic = mse_rho_ic.item() if isinstance(mse_rho_ic, torch.Tensor) else 0.0
-        last_mse_rho = mse_rho.item()
-        last_mse_velx = mse_velx.item()
-        last_mse_phi = mse_phi.item()
-        if model.dimension >= 2:
-            last_mse_vy_ic = mse_vy_ic.item()
-            last_mse_vely = mse_vely.item()
-        if model.dimension == 3:
-            last_mse_vz_ic = mse_vz_ic.item()
-            last_mse_velz = mse_velz.item()
-    
-    # Add Poisson IC loss if needed
-    mse_poisson_ic = 0.0
-    mse_phi_mean = 0.0
-    if collocation_poisson_ic is not None:
-        from core.losses import poisson_residue_only
-        from config import POISSON_IC_WEIGHT, PHI_MEAN_CONSTRAINT_WEIGHT
-        
-        poisson_loss = torch.tensor(0.0, device=device)
-        
-        if POISSON_IC_WEIGHT > 0:
-            phi_r_ic = poisson_residue_only(collocation_poisson_ic, net, dimension=model.dimension)
-            mse_poisson_ic = torch.mean(phi_r_ic ** 2)
-            poisson_loss = poisson_loss + POISSON_IC_WEIGHT * mse_poisson_ic
-        
-        if PHI_MEAN_CONSTRAINT_WEIGHT > 0:
-            net_output_ic = net(collocation_poisson_ic)
-            phi_ic = net_output_ic[:, -1]
-            mean_phi = torch.mean(phi_ic)
-            mse_phi_mean = mean_phi ** 2
-            poisson_loss = poisson_loss + PHI_MEAN_CONSTRAINT_WEIGHT * mse_phi_mean
-        
-        if poisson_loss.requires_grad:
-            poisson_loss.backward()
-            total_loss_scalar += poisson_loss.item()
-
-    # Apply gradient clipping
+    # ── Gradient clipping ─────────────────────────────────────────────────────
+    # Measure gradient norm before clipping for monitoring
+    grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=float('inf'))
+    # Now actually clip
     torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-    
-    # Create loss breakdown dictionary
-    loss_breakdown = {}
-    
-    ic_loss = last_mse_vx_ic
-    if last_mse_rho_ic > 0:
-        ic_loss += last_mse_rho_ic
-    if model.dimension == 2:
-        ic_loss += last_mse_vy_ic
-    elif model.dimension == 3:
-        ic_loss += last_mse_vy_ic
-        ic_loss += last_mse_vz_ic
-    loss_breakdown['IC'] = ic_loss
-    
-    pde_loss = last_mse_rho + last_mse_velx
-    if model.dimension == 2:
-        pde_loss += last_mse_vely
-    elif model.dimension == 3:
-        pde_loss += last_mse_vely
-        pde_loss += last_mse_velz
-    pde_loss += last_mse_phi
-    loss_breakdown['PDE'] = pde_loss
-    
-    if isinstance(mse_poisson_ic, torch.Tensor):
-        loss_breakdown['Poisson_IC'] = mse_poisson_ic.item()
-    if isinstance(mse_phi_mean, torch.Tensor):
-        loss_breakdown['Phi_Mean'] = mse_phi_mean.item()
-    
-    for label, value in last_data_breakdown.items():
-        loss_breakdown[label] = value
 
-    # Return average loss as tensor for L-BFGS compatibility
-    avg_loss = torch.tensor(total_loss_scalar / max(1, num_effective_batches), device=device, requires_grad=False)
+    avg_scalars = {k: v / max(1, num_effective_batches) for k, v in accum_scalars.items()}
+    avg_data_breakdown = {
+        label: value / max(1, num_effective_batches)
+        for label, value in accum_data_breakdown.items()
+    }
+
+    loss_breakdown = _build_loss_breakdown(avg_scalars, model, avg_data_breakdown)
+    loss_breakdown['grad_norm'] = grad_norm_before_clip.item()
+
+    # requires_grad=False: returned tensor is used by L-BFGS only for logging,
+    # not for further differentiation
+    avg_loss_scalar = total_loss_scalar / max(1, num_effective_batches)
+    avg_loss = torch.tensor(avg_loss_scalar,
+                            device=device, requires_grad=False)
     return avg_loss, loss_breakdown
