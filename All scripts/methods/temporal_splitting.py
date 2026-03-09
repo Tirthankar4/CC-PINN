@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 from core.data_generator import col_gen
+from config import GRAVITY
 
 
 @dataclass
@@ -55,7 +56,8 @@ def evaluate_frozen_network(prev_net, coords, dimension):
     if dimension == 3:
         result['z']  = coords[2]
         result['vz'] = out[:, 3:4]
-    result['phi'] = out[:, -1:]
+    if GRAVITY:
+        result['phi'] = out[:, -1:]
     return result
 
 

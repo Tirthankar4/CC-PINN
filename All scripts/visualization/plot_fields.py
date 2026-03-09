@@ -1,4 +1,6 @@
 from .plot_utils import *
+from config import GRAVITY
+from numerical_solvers.LAX_torch import lax_solver_torch
 
 def plot_function(net, time_array, initial_params, velocity=False, isplot=False, animation=False):
     """
@@ -63,7 +65,7 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
         rho_pred0 = rho_tensor.detach().cpu().numpy()
         v_pred_x0 = vx_tensor.detach().cpu().numpy()
         v_pred_y0 = vy_tensor.detach().cpu().numpy() if vy_tensor is not None else None
-        phi_pred0 = phi_tensor.detach().cpu().numpy()
+        phi_pred0 = phi_tensor.detach().cpu().numpy() if phi_tensor is not None else None
  
         rho_max_PN = np.max(rho_pred0)
         
@@ -109,14 +111,15 @@ def plot_function(net, time_array, initial_params, velocity=False, isplot=False,
                 plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
                 #plt.savefig(output_folder+'/PINNS_velocity'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
 
-            # Potential plot
-            plt.figure(3)
-            plt.plot(X, phi_pred0, '--', label="t={}".format(round(t,2)))
-            plt.ylabel(r"$\phi$")
-            plt.xlabel("x")
-            plt.title("PINNs Solution Potential")
-            plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
-            #plt.savefig(output_folder+'/phi'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
+            if GRAVITY and phi_pred0 is not None:
+                # Potential plot
+                plt.figure(3)
+                plt.plot(X, phi_pred0, '--', label="t={}".format(round(t,2)))
+                plt.ylabel(r"$\phi$")
+                plt.xlabel("x")
+                plt.title("PINNs Solution Potential")
+                plt.legend(numpoints=1, loc='upper right', fancybox=True, shadow=True)
+                #plt.savefig(output_folder+'/phi'+str(lam)+'_'+str(int(num_of_waves_x))+'_'+str(tmax)+'.png', dpi=300)
 
         
         else:  
@@ -316,25 +319,52 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=None, ax=None, which=
                     "LAX 2D (shared-field cpu)",
                     lax_solution,
                     time, n_fd_use, nu, lam, num_of_waves, rho_1,
-                    gravity=True, isplot=False, comparison=False, animation=True,
+                    gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                     vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
                 )
             else:
                 if torch.cuda.is_available():
                     _clear_cuda_cache()
-                    x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
-                        "LAX 2D (torch)",
-                        lax_solution_torch,
-                        time_val=time, N=N_use, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=ps_index,
-                        vel_rms=vel_rms, random_seed=random_seed
+                    Lx = lam * num_of_waves
+                    domain_params = {"Lx": Lx, "Ly": Lx, "nx": N_use, "ny": N_use}
+                    physics_params = {
+                        "c_s": cs,
+                        "rho_o": rho_o,
+                        "const": const,
+                        "G": G,
+                        "rho_1": rho_1,
+                        "lam": lam,
+                    }
+                    options = {"gravity": GRAVITY, "nu": nu, "comparison": False, "isplot": False}
+                    if use_velocity_ps:
+                        ic_type = "power_spectrum"
+                        ic_params = {
+                            "power_index": ps_index,
+                            "amplitude": vel_rms,
+                            "random_seed": random_seed,
+                        }
+                    else:
+                        ic_type = "sinusoidal"
+                        ic_params = {"KX": KX, "KY": KY}
+                    result_2d = _timed_call(
+                        "LAX 2D (unified torch)",
+                        lax_solver_torch,
+                        time=time,
+                        domain_params=domain_params,
+                        physics_params=physics_params,
+                        ic_type=ic_type,
+                        ic_params=ic_params,
+                        options=options,
                     )
-                    _phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                    x_fd = result_2d.coordinates["x"]
+                    rho_fd = result_2d.density
+                    vx_fd, vy_fd = result_2d.velocity_components
+                    _phi_fd = result_2d.potential if result_2d.potential is not None else np.zeros_like(rho_fd)
                 else:
                     x_fd, rho_fd, vx_fd, vy_fd, _phi_fd, _n, _rho_max = _timed_call(
                         "LAX 2D (cpu)",
                         lax_solution,
-                        time, N_use, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        time, N_use, nu, lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                         use_velocity_ps=use_velocity_ps, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
                     )
 

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from config import GRAVITY
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -16,8 +17,6 @@ def _compute_ic_component_losses(net, collocation_IC, rho_1, lam, jeans, v_1, di
         Dict with component-wise losses: {'rho', 'vx', 'vy', 'vz', 'phi'}
     """
     from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
-    from config import rho_o
-    
     with torch.no_grad():
         # Get true ICs
         rho_0 = fun_rho_0(rho_1, lam, collocation_IC)
@@ -31,16 +30,16 @@ def _compute_ic_component_losses(net, collocation_IC, rho_1, lam, jeans, v_1, di
         vx_ic_out = net_ic_out[:, 1:2]
         vy_ic_out = net_ic_out[:, 2:3]
         vz_ic_out = net_ic_out[:, 3:4]
-        phi_ic_out = net_ic_out[:, 4:5]
-        
         # Compute component losses
         ic_losses = {
             'rho': mse_cost_function(rho_ic_out, rho_0).item(),
             'vx': mse_cost_function(vx_ic_out, vx_0).item(),
             'vy': mse_cost_function(vy_ic_out, vy_0).item(),
             'vz': mse_cost_function(vz_ic_out, vz_0).item(),
-            'phi': torch.mean(phi_ic_out ** 2).item(),  # phi should be close to 0 ideally
         }
+        if GRAVITY and net_ic_out.shape[1] > 4:
+            phi_ic_out = net_ic_out[:, 4:5]
+            ic_losses['phi'] = torch.mean(phi_ic_out ** 2).item()  # phi should be close to 0 ideally
     
     return ic_losses
 
@@ -228,7 +227,7 @@ class TrainingDiagnostics:
             rho_res_all = np.zeros(total_points, dtype=np.float32)
             vx_res_all = np.zeros(total_points, dtype=np.float32)
             vy_res_all = np.zeros(total_points, dtype=np.float32)
-            phi_res_all = np.zeros(total_points, dtype=np.float32)
+            phi_res_all = np.zeros(total_points, dtype=np.float32) if GRAVITY else None
             
             # Process in chunks
             chunk_size = 40000
@@ -243,26 +242,35 @@ class TrainingDiagnostics:
                 
                 colloc_chunk = [x_chunk, y_chunk, t_chunk]
                 
-                rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_chunk, model, dimension=2)
+                if GRAVITY:
+                    rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_chunk, model, dimension=2)
+                else:
+                    rho_r, vx_r, vy_r = pde_residue(colloc_chunk, model, dimension=2)
+                    phi_r = None
                 
                 rho_res_all[i:end_idx] = rho_r.detach().cpu().numpy().flatten()
                 vx_res_all[i:end_idx] = vx_r.detach().cpu().numpy().flatten()
                 vy_res_all[i:end_idx] = vy_r.detach().cpu().numpy().flatten()
-                phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
+                if GRAVITY:
+                    phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
                 
-                del x_chunk, y_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r, phi_r
+                del x_chunk, y_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r
+                if GRAVITY:
+                    del phi_r
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
             
-            return {
+            result = {
                 'x': x.cpu().numpy(),
                 'y': y.cpu().numpy(),
                 't': t.cpu().numpy(),
                 'rho_residual': rho_res_all.reshape(n_spatial, n_spatial, n_temporal),
                 'vx_residual': vx_res_all.reshape(n_spatial, n_spatial, n_temporal),
                 'vy_residual': vy_res_all.reshape(n_spatial, n_spatial, n_temporal),
-                'phi_residual': phi_res_all.reshape(n_spatial, n_spatial, n_temporal)
             }
+            if GRAVITY:
+                result['phi_residual'] = phi_res_all.reshape(n_spatial, n_spatial, n_temporal)
+            return result
         
         elif dimension == 3:
             # For 3D, use coarser grid to save memory
@@ -286,7 +294,7 @@ class TrainingDiagnostics:
             vx_res_all = np.zeros(total_points, dtype=np.float32)
             vy_res_all = np.zeros(total_points, dtype=np.float32)
             vz_res_all = np.zeros(total_points, dtype=np.float32)
-            phi_res_all = np.zeros(total_points, dtype=np.float32)
+            phi_res_all = np.zeros(total_points, dtype=np.float32) if GRAVITY else None
             
             chunk_size = 20000
             model.eval()
@@ -301,19 +309,26 @@ class TrainingDiagnostics:
                 
                 colloc_chunk = [x_chunk, y_chunk, z_chunk, t_chunk]
                 
-                rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_chunk, model, dimension=3)
+                if GRAVITY:
+                    rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_chunk, model, dimension=3)
+                else:
+                    rho_r, vx_r, vy_r, vz_r = pde_residue(colloc_chunk, model, dimension=3)
+                    phi_r = None
                 
                 rho_res_all[i:end_idx] = rho_r.detach().cpu().numpy().flatten()
                 vx_res_all[i:end_idx] = vx_r.detach().cpu().numpy().flatten()
                 vy_res_all[i:end_idx] = vy_r.detach().cpu().numpy().flatten()
                 vz_res_all[i:end_idx] = vz_r.detach().cpu().numpy().flatten()
-                phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
+                if GRAVITY:
+                    phi_res_all[i:end_idx] = phi_r.detach().cpu().numpy().flatten()
                 
-                del x_chunk, y_chunk, z_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r, vz_r, phi_r
+                del x_chunk, y_chunk, z_chunk, t_chunk, colloc_chunk, rho_r, vx_r, vy_r, vz_r
+                if GRAVITY:
+                    del phi_r
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
             
-            return {
+            result = {
                 'x': x.cpu().numpy(),
                 'y': y.cpu().numpy(),
                 't': t.cpu().numpy(),
@@ -321,8 +336,10 @@ class TrainingDiagnostics:
                 'vx_residual': vx_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
                 'vy_residual': vy_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
                 'vz_residual': vz_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal),
-                'phi_residual': phi_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal)
             }
+            if GRAVITY:
+                result['phi_residual'] = phi_res_all.reshape(n_spatial_3d, n_spatial_3d, n_temporal)
+            return result
     
     def plot_residual_heatmaps(self, residual_data, slice_idx=None):
         """
@@ -332,18 +349,24 @@ class TrainingDiagnostics:
         if slice_idx is None:
             slice_idx = residual_data['rho_residual'].shape[1] // 2
         
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
-        
         residuals = [
             ('Continuity Equation', residual_data['rho_residual']),
             ('Momentum X Equation', residual_data['vx_residual']),
             ('Momentum Y Equation', residual_data['vy_residual']),
-            ('Poisson Equation', residual_data['phi_residual'])
         ]
+        if 'vz_residual' in residual_data:
+            residuals.append(('Momentum Z Equation', residual_data['vz_residual']))
+        if 'phi_residual' in residual_data:
+            residuals.append(('Poisson Equation', residual_data['phi_residual']))
+
+        n_plots = len(residuals)
+        n_cols = 2
+        n_rows = int(np.ceil(n_plots / n_cols))
+        fig = plt.figure(figsize=(16, 5 * n_rows))
+        gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.3, wspace=0.3)
         
         for idx, (name, resid) in enumerate(residuals):
-            ax = fig.add_subplot(gs[idx // 2, idx % 2])
+            ax = fig.add_subplot(gs[idx // n_cols, idx % n_cols])
             
             # Slice at fixed y
             resid_slice = resid[:, slice_idx, :].T  # (t, x) for imshow
@@ -838,11 +861,14 @@ class TrainingDiagnostics:
         
         error_data = {
             'times': time_points,
-            'pde_residuals': {'continuity': [], 'momentum_x': [], 'momentum_y': [], 'poisson': []},
+            'pde_residuals': {'continuity': [], 'momentum_x': [], 'momentum_y': []},
             'field_ranges': {'rho': [], 'vx': [], 'vy': []},
-            'gradient_norms': {'rho': [], 'vx': [], 'vy': [], 'phi': []},
+            'gradient_norms': {'rho': [], 'vx': [], 'vy': []},
             'max_residuals': []
         }
+        if GRAVITY:
+            error_data['pde_residuals']['poisson'] = []
+            error_data['gradient_norms']['phi'] = []
         
         if dimension == 3:
             error_data['pde_residuals']['momentum_z'] = []
@@ -882,28 +908,38 @@ class TrainingDiagnostics:
             
             # Compute ACTUAL PDE residuals using the proper residue function
             if dimension == 2:
-                rho_r, vx_r, vy_r, phi_r = pde_residue(colloc, model, dimension=2)
+                if GRAVITY:
+                    rho_r, vx_r, vy_r, phi_r = pde_residue(colloc, model, dimension=2)
+                else:
+                    rho_r, vx_r, vy_r = pde_residue(colloc, model, dimension=2)
+                    phi_r = None
                 
                 error_data['pde_residuals']['continuity'].append(torch.abs(rho_r).mean().item())
                 error_data['pde_residuals']['momentum_x'].append(torch.abs(vx_r).mean().item())
                 error_data['pde_residuals']['momentum_y'].append(torch.abs(vy_r).mean().item())
-                error_data['pde_residuals']['poisson'].append(torch.abs(phi_r).mean().item())
+                if GRAVITY:
+                    error_data['pde_residuals']['poisson'].append(torch.abs(phi_r).mean().item())
                 
             else:  # 3D
-                rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc, model, dimension=3)
+                if GRAVITY:
+                    rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc, model, dimension=3)
+                else:
+                    rho_r, vx_r, vy_r, vz_r = pde_residue(colloc, model, dimension=3)
+                    phi_r = None
                 
                 error_data['pde_residuals']['continuity'].append(torch.abs(rho_r).mean().item())
                 error_data['pde_residuals']['momentum_x'].append(torch.abs(vx_r).mean().item())
                 error_data['pde_residuals']['momentum_y'].append(torch.abs(vy_r).mean().item())
                 error_data['pde_residuals']['momentum_z'].append(torch.abs(vz_r).mean().item())
-                error_data['pde_residuals']['poisson'].append(torch.abs(phi_r).mean().item())
+                if GRAVITY:
+                    error_data['pde_residuals']['poisson'].append(torch.abs(phi_r).mean().item())
             
             # Get predictions for field statistics
             pred = model(colloc)
             rho = pred[:, 0:1]
             vx = pred[:, 1:2]
             vy = pred[:, 2:3]
-            phi = pred[:, -1:]  # Last column is phi
+            phi = pred[:, -1:] if GRAVITY else None
             
             # Track field statistics
             error_data['field_ranges']['rho'].append(torch.std(rho).item())
@@ -922,14 +958,16 @@ class TrainingDiagnostics:
                 vx_grad_y = torch.autograd.grad(vx.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 vy_grad_x = torch.autograd.grad(vy.sum(), X_flat, create_graph=False, retain_graph=True)[0]
                 vy_grad_y = torch.autograd.grad(vy.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
-                phi_grad_x = torch.autograd.grad(phi.sum(), X_flat, create_graph=False, retain_graph=True)[0]
-                phi_grad_y = torch.autograd.grad(phi.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
+                if GRAVITY:
+                    phi_grad_x = torch.autograd.grad(phi.sum(), X_flat, create_graph=False, retain_graph=True)[0]
+                    phi_grad_y = torch.autograd.grad(phi.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                 
                 # Compute full gradient magnitudes
                 rho_grad_mag = torch.sqrt(rho_grad_x**2 + rho_grad_y**2)
                 vx_grad_mag = torch.sqrt(vx_grad_x**2 + vx_grad_y**2)
                 vy_grad_mag = torch.sqrt(vy_grad_x**2 + vy_grad_y**2)
-                phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2)
+                if GRAVITY:
+                    phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2)
                 
                 if dimension == 3:
                     rho_grad_z = torch.autograd.grad(rho.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
@@ -938,27 +976,32 @@ class TrainingDiagnostics:
                     vz_grad_x = torch.autograd.grad(vz.sum(), X_flat, create_graph=False, retain_graph=True)[0]
                     vz_grad_y = torch.autograd.grad(vz.sum(), Y_flat, create_graph=False, retain_graph=True)[0]
                     vz_grad_z = torch.autograd.grad(vz.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
-                    phi_grad_z = torch.autograd.grad(phi.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
+                    if GRAVITY:
+                        phi_grad_z = torch.autograd.grad(phi.sum(), Z_flat, create_graph=False, retain_graph=True)[0]
                     
                     rho_grad_mag = torch.sqrt(rho_grad_x**2 + rho_grad_y**2 + rho_grad_z**2)
                     vx_grad_mag = torch.sqrt(vx_grad_x**2 + vx_grad_y**2 + vx_grad_z**2)
                     vy_grad_mag = torch.sqrt(vy_grad_x**2 + vy_grad_y**2 + vy_grad_z**2)
-                    phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2 + phi_grad_z**2)
+                    if GRAVITY:
+                        phi_grad_mag = torch.sqrt(phi_grad_x**2 + phi_grad_y**2 + phi_grad_z**2)
                     vz_grad_mag = torch.sqrt(vz_grad_x**2 + vz_grad_y**2 + vz_grad_z**2)
                     error_data['gradient_norms']['vz'].append(torch.norm(vz_grad_mag).item())
                 
                 error_data['gradient_norms']['rho'].append(torch.norm(rho_grad_mag).item())
                 error_data['gradient_norms']['vx'].append(torch.norm(vx_grad_mag).item())
                 error_data['gradient_norms']['vy'].append(torch.norm(vy_grad_mag).item())
-                error_data['gradient_norms']['phi'].append(torch.norm(phi_grad_mag).item())
+                if GRAVITY:
+                    error_data['gradient_norms']['phi'].append(torch.norm(phi_grad_mag).item())
             
             # Max residual magnitude (now including Poisson!)
-            max_res = max(
+            max_candidates = [
                 error_data['pde_residuals']['continuity'][-1],
                 error_data['pde_residuals']['momentum_x'][-1],
                 error_data['pde_residuals']['momentum_y'][-1],
-                error_data['pde_residuals']['poisson'][-1]
-            )
+            ]
+            if GRAVITY:
+                max_candidates.append(error_data['pde_residuals']['poisson'][-1])
+            max_res = max(max_candidates)
             if dimension == 3:
                 max_res = max(max_res, error_data['pde_residuals']['momentum_z'][-1])
             
@@ -981,8 +1024,8 @@ class TrainingDiagnostics:
         ax1.semilogy(times, error_data['pde_residuals']['continuity'], 'b-', linewidth=2, label='Continuity', marker='o', markersize=4)
         ax1.semilogy(times, error_data['pde_residuals']['momentum_x'], 'r-', linewidth=2, label='Momentum X', marker='s', markersize=4)
         ax1.semilogy(times, error_data['pde_residuals']['momentum_y'], 'g-', linewidth=2, label='Momentum Y', marker='^', markersize=4)
-        # IMPORTANT: Now showing actual Poisson residuals!
-        ax1.semilogy(times, error_data['pde_residuals']['poisson'], 'orange', linewidth=2.5, label='Poisson', marker='*', markersize=6)
+        if 'poisson' in error_data['pde_residuals']:
+            ax1.semilogy(times, error_data['pde_residuals']['poisson'], 'orange', linewidth=2.5, label='Poisson', marker='*', markersize=6)
         if 'momentum_z' in error_data['pde_residuals']:
             ax1.semilogy(times, error_data['pde_residuals']['momentum_z'], 'm-', linewidth=2, label='Momentum Z', marker='d', markersize=4)
         ax1.set_xlabel('Time', fontsize=11)
@@ -1025,7 +1068,8 @@ class TrainingDiagnostics:
         # Plot 4: Gradient Norm Evolution (NOW WITH ALL FIELDS INCLUDING PHI!)
         ax4 = fig.add_subplot(gs[1, 0])
         ax4.semilogy(times, np.array(error_data['gradient_norms']['rho']) + 1e-12, 'b-', linewidth=2.5, label='∇ρ', marker='o', markersize=4)
-        ax4.semilogy(times, np.array(error_data['gradient_norms']['phi']) + 1e-12, 'orange', linewidth=2.5, label='∇φ', marker='*', markersize=6)
+        if 'phi' in error_data['gradient_norms']:
+            ax4.semilogy(times, np.array(error_data['gradient_norms']['phi']) + 1e-12, 'orange', linewidth=2.5, label='∇φ', marker='*', markersize=6)
         ax4.semilogy(times, np.array(error_data['gradient_norms']['vx']) + 1e-12, 'r--', linewidth=1.5, label='∇vx', marker='s', markersize=3, alpha=0.7)
         ax4.semilogy(times, np.array(error_data['gradient_norms']['vy']) + 1e-12, 'g--', linewidth=1.5, label='∇vy', marker='^', markersize=3, alpha=0.7)
         if 'vz' in error_data['gradient_norms']:

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from config import STARTUP_DT
-from config import cs, const, G, rho_o
+from config import cs, const, G, rho_o, GRAVITY
 
 def diff(u, var, order = 1): #The derivative of a variable with respect to another.
     
@@ -234,6 +234,11 @@ def req_consts_calc(lam, rho_1):
         - alpha: Growth rate or oscillation frequency depending on lam vs jeans_length
     """
     
+    if not GRAVITY:
+        jeans = float("inf")
+        alpha = cs * (2 * np.pi / lam)
+        return jeans, alpha
+
     if rho_o != 0:
         jeans = np.sqrt(4*np.pi**2*cs**2/(const*G*rho_o))
     else:

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from config import AdaptiveCollocationConfig  # noqa: F401  (re-exported for callers)
+from config import GRAVITY
 
 def compute_pointwise_residuals(net, collocation_domain, dimension):
     """Score each collocation point by total PDE residual magnitude."""
@@ -17,14 +18,26 @@ def compute_pointwise_residuals(net, collocation_domain, dimension):
     
     try:
         if dimension == 1:
-            rho_r, vx_r, phi_r = pde_residue(collocation_domain, net, dimension=1)
-            residual = (rho_r**2 + vx_r**2 + phi_r**2).detach()
+            if GRAVITY:
+                rho_r, vx_r, phi_r = pde_residue(collocation_domain, net, dimension=1)
+                residual = (rho_r**2 + vx_r**2 + phi_r**2).detach()
+            else:
+                rho_r, vx_r = pde_residue(collocation_domain, net, dimension=1)
+                residual = (rho_r**2 + vx_r**2).detach()
         elif dimension == 2:
-            rho_r, vx_r, vy_r, phi_r = pde_residue(collocation_domain, net, dimension=2)
-            residual = (rho_r**2 + vx_r**2 + vy_r**2 + phi_r**2).detach()
+            if GRAVITY:
+                rho_r, vx_r, vy_r, phi_r = pde_residue(collocation_domain, net, dimension=2)
+                residual = (rho_r**2 + vx_r**2 + vy_r**2 + phi_r**2).detach()
+            else:
+                rho_r, vx_r, vy_r = pde_residue(collocation_domain, net, dimension=2)
+                residual = (rho_r**2 + vx_r**2 + vy_r**2).detach()
         elif dimension == 3:
-            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(collocation_domain, net, dimension=3)
-            residual = (rho_r**2 + vx_r**2 + vy_r**2 + vz_r**2 + phi_r**2).detach()
+            if GRAVITY:
+                rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(collocation_domain, net, dimension=3)
+                residual = (rho_r**2 + vx_r**2 + vy_r**2 + vz_r**2 + phi_r**2).detach()
+            else:
+                rho_r, vx_r, vy_r, vz_r = pde_residue(collocation_domain, net, dimension=3)
+                residual = (rho_r**2 + vx_r**2 + vy_r**2 + vz_r**2).detach()
         else:
             raise ValueError("Invalid dimension")
     finally:

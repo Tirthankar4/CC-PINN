@@ -1,5 +1,5 @@
 """
-Configuration system for GRINN (Gravitational Instability Neural Network).
+Configuration system for GRINN (Gravity Informed Neural Network).
 
 Uses @dataclass(frozen=True) for type-safe, immutable configuration.
 Supports YAML serialization for reproducible experiment tracking.
@@ -30,7 +30,8 @@ class PhysicsConfig:
     rho_o: float = 1.0         # Background density
     const: float = 1.0         # Poisson coupling constant (4πG)
     G: float = 1.0             # Gravitational constant
-    a: float = 0.1             # Perturbation amplitude
+    a: float = 0.3             # Perturbation amplitude
+    gravity: bool = True       # Enable/disable self-gravity coupling
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ class DomainConfig:
     ymin: float = 0.0
     zmin: float = 0.0
     tmin: float = 0.0
-    tmax: float = 4.0
+    tmax: float = 4.5
     wave: float = 7.0          # Wavelength
     num_of_waves: float = 2.0  # Number of wavelengths in domain
 
@@ -54,15 +55,15 @@ class DomainConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     """Training hyperparameters and collocation point settings."""
-    N_0: int = 25000                       # Initial condition points
+    N_0: int = 15000                       # Initial condition points
     N_r: int = 70000                       # Residual / collocation points
-    batch_size: int = 95000                # Max points per mini-batch
+    batch_size: int = 85000                # Max points per mini-batch
     num_batches: int = 1                   # Mini-batches per optimizer step
-    iteration_adam: int = 1001             # Adam iterations
+    iteration_adam: int = 2001             # Adam iterations
     iteration_lbfgs: int = 201             # L-BFGS iterations
     ic_weight: float = 1.0                # IC loss weight
     # Causality
-    startup_dt: float = 0.01              # PDE enforcement delay
+    startup_dt: float = 0.0              # PDE enforcement delay
 
 
 @dataclass(frozen=True)
@@ -96,7 +97,7 @@ class VisualizationConfig:
 @dataclass(frozen=True)
 class InitialConditionConfig:
     """Initial condition mode selection."""
-    mode: str = "power_spectrum"  # "sinusoidal" or "power_spectrum"
+    mode: str = "sinusoidal"  # "sinusoidal" or "power_spectrum"
 
 
 @dataclass(frozen=True)
@@ -107,11 +108,11 @@ class SinusoidalConfig:
     KY: float = 0.0
     KZ: float = 0.0
     # 1D cross-section settings
-    times_1d: Tuple[float, ...] = (2.5, 3.0, 3.5)
+    times_1d: Tuple[float, ...] = (1.0, 2.0, 3.0)
     fd_n_1d: int = 300
-    fd_n_2d: int = 300
+    fd_n_2d: int = 1000
     fd_n_3d: int = 300
-    fd_nu: float = 0.5            # Courant number for LAX solver
+    fd_nu: float = 0.1            # Courant number for LAX solver
     show_linear_theory: bool = False
 
 
@@ -122,7 +123,7 @@ class PowerSpectrumConfig:
     n_grid_3d: int = 400
     fd_nu_power: float = 0.25
     power_exponent: int = -4
-    random_seed: int = 93        # Seed for IC field generation (big impact on field morphology)
+    random_seed: int = 9        # Seed for IC field generation (big impact on field morphology)
 
 
 @dataclass(frozen=True)
@@ -131,8 +132,8 @@ class AdaptiveCollocationConfig:
     enabled: bool = True
     resample_every_n: int = 50       # Resample every N Adam iterations
     n_candidates: int = 5000         # Candidate points generated at each resample
-    keep_fraction: float = 0.8       # Fraction of pool kept (highest-residual points)
-    uniform_fraction: float = 0.2    # Fraction replaced with fresh uniform points
+    keep_fraction: float = 0.5       # Fraction of pool kept (highest-residual points)
+    uniform_fraction: float = 0.5    # Fraction replaced with fresh uniform points
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -265,6 +266,7 @@ rho_o = CONFIG.physics.rho_o
 const = CONFIG.physics.const
 G     = CONFIG.physics.G
 a     = CONFIG.physics.a
+GRAVITY = CONFIG.physics.gravity
 
 # --- Domain ---
 DIMENSION    = CONFIG.domain.dimension

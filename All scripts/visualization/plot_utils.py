@@ -211,7 +211,7 @@ def _timed_call(label, fn, *args, **kwargs):
 from config import (SAVE_STATIC_SNAPSHOTS, SNAPSHOT_DIR, PERTURBATION_TYPE, cs, const, G, rho_o,
                     TIMES_1D, a, KX, KY, KZ, FD_N_1D, FD_N_2D, FD_N_3D, FD_NU_SINUSOIDAL,
                     FD_NU_POWER, POWER_EXPONENT,
-                    N_GRID, N_GRID_3D, DIMENSION, SLICE_Y, SLICE_Z)
+                    N_GRID, N_GRID_3D, DIMENSION, SLICE_Y, SLICE_Z, GRAVITY)
 from config import RANDOM_SEED, SHOW_LINEAR_THEORY
 
 # Global variable to store shared velocity fields for plotting
@@ -240,14 +240,14 @@ def _split_outputs(outputs):
     vx = outputs[:, 1:2]
     vy = outputs[:, 2:3] if DIMENSION >= 2 else None
     if DIMENSION == 1:
-        phi = outputs[:, 2:3]
+        phi = outputs[:, 2:3] if GRAVITY else None
         vz = None
     elif DIMENSION == 2:
-        phi = outputs[:, 3:4]
+        phi = outputs[:, 3:4] if GRAVITY else None
         vz = None
     else:
         vz = outputs[:, 3:4]
-        phi = outputs[:, 4:5]
+        phi = outputs[:, 4:5] if GRAVITY else None
     return rho, vx, vy, vz, phi
 
 def set_shared_velocity_fields(vx_np, vy_np, vz_np=None):
@@ -319,7 +319,7 @@ def _call_unified_3d_solver(time, lam, num_of_waves, rho_1, nu=None,
     if nu is None:
         nu = _get_fd_nu()
     options = {
-        'gravity': True,
+        'gravity': GRAVITY,
         'nu': nu,
         'comparison': False,
         'isplot': False
@@ -513,7 +513,10 @@ def compute_fd_data_cache(initial_params, time_points, N=200, nu=None,
             rho_fd = rho_vol[:, :, z_idx]
             vx_fd = vx_vol[:, :, z_idx]
             vy_fd = vy_vol[:, :, z_idx]
-            phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+            if GRAVITY:
+                phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
+            else:
+                phi_fd = None
             
             # Store selected z for later use
             fd_cache[t] = {
@@ -544,7 +547,7 @@ def compute_fd_data_cache(initial_params, time_points, N=200, nu=None,
             'rho_1': rho_1,
             'lam': lam
         }
-        options = {'gravity': True, 'nu': nu, 'comparison': False, 'isplot': False}
+        options = {'gravity': GRAVITY, 'nu': nu, 'comparison': False, 'isplot': False}
         
         # Set up IC parameters
         if use_velocity_ps:
@@ -600,7 +603,10 @@ def compute_fd_data_cache(initial_params, time_points, N=200, nu=None,
             y_fd = result.coordinates['y']
             rho_fd = result.density
             vx_fd, vy_fd = result.velocity_components
-            phi_fd = result.potential if hasattr(result, 'potential') and result.potential is not None else np.zeros_like(rho_fd)
+            if GRAVITY:
+                phi_fd = result.potential if hasattr(result, 'potential') and result.potential is not None else np.zeros_like(rho_fd)
+            else:
+                phi_fd = None
             
             fd_cache[t] = {
                 'x': x_fd,

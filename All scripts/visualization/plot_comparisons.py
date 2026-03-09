@@ -1,5 +1,7 @@
 from .plot_utils import *
 from .plot_fields import *
+from config import GRAVITY
+from numerical_solvers.LAX_torch import lax_solver_torch
 
 def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
     """
@@ -20,7 +22,8 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
     print("Creating 1D cross section comparison plots...")
     
     # Create comparison plots
-    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    n_cols = 3 if GRAVITY else 2
+    fig, axes = plt.subplots(3, n_cols, figsize=(5 * n_cols, 12))
     axes = axes.flatten()
 
     # Collect all velocity data to determine appropriate y-axis limits
@@ -33,7 +36,7 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
             "LAX comparison slice (cpu)",
             lax_solution,
-            time, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+            time, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=True, animation=True
         )
         
         # Get PINN solution
@@ -50,7 +53,9 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
         rho_FD_interp = interp1d(x, rho[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
         v_LT_interp = interp1d(x, v_LT, kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
         v_FD_interp = interp1d(x, v[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
-        phi_FD_interp = interp1d(x, phi[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
+        phi_FD_interp = None
+        if GRAVITY:
+            phi_FD_interp = interp1d(x, phi[n-1,:], kind='linear', bounds_error=False, fill_value='extrapolate')(X_flat)
         
         # Collect velocity data for limit calculation
         all_velocity_data.append(v_pred_x0)
@@ -59,39 +64,44 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
             all_velocity_data.append(v_LT_interp)
         
         # Density comparison plots
-        axes[i*3].plot(X, rho_pred0, color='c', linewidth=3, label="PINN")
+        idx_den = i * n_cols
+        idx_vel = idx_den + 1
+        axes[idx_den].plot(X, rho_pred0, color='c', linewidth=3, label="PINN")
         # Only plot Linear Theory when KY == 0 and amplitude is small
         if (np.isclose(KY, 0.0)) and (a < 0.1):
-            axes[i*3].plot(X, rho_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
-        axes[i*3].plot(X, rho_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
-        axes[i*3].set_xlim(xmin, xmax)
-        axes[i*3].set_title(f"Density at t={time:.1f}")
-        axes[i*3].set_ylabel(r"$\rho$")
-        axes[i*3].grid(True)
-        axes[i*3].legend()
-        axes[i*3].set_ylim(0.5*rho_o, 1.5*rho_o)
+            axes[idx_den].plot(X, rho_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        axes[idx_den].plot(X, rho_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[idx_den].set_xlim(xmin, xmax)
+        axes[idx_den].set_title(f"Density at t={time:.1f}")
+        axes[idx_den].set_ylabel(r"$\rho$")
+        axes[idx_den].grid(True)
+        axes[idx_den].legend()
+        axes[idx_den].set_ylim(0.5*rho_o, 1.5*rho_o)
         
         # Velocity comparison plots
-        axes[i*3+1].plot(X, v_pred_x0, color='c', linewidth=3, label="PINN")
+        axes[idx_vel].plot(X, v_pred_x0, color='c', linewidth=3, label="PINN")
         # Only plot Linear Theory when KY == 0 and amplitude is small
         if (np.isclose(KY, 0.0)) and (a < 0.1):
-            axes[i*3+1].plot(X, v_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
-        axes[i*3+1].plot(X, v_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
-        axes[i*3+1].set_xlim(xmin, xmax)
-        axes[i*3+1].set_title(f"Velocity at t={time:.1f}")
-        axes[i*3+1].set_ylabel("$v_x$")
-        axes[i*3+1].grid(True)
-        axes[i*3+1].legend()
+            axes[idx_vel].plot(X, v_LT_interp, linestyle='dashed', color='firebrick', linewidth=2, label="Linear Theory")
+        axes[idx_vel].plot(X, v_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+        axes[idx_vel].set_xlim(xmin, xmax)
+        axes[idx_vel].set_title(f"Velocity at t={time:.1f}")
+        axes[idx_vel].set_ylabel("$v_x$")
+        axes[idx_vel].grid(True)
+        axes[idx_vel].legend()
+        if not GRAVITY:
+            axes[idx_vel].set_xlabel("x")
         
-        # Potential comparison plots
-        axes[i*3+2].plot(X, phi_pred0, color='c', linewidth=3, label="PINN")
-        axes[i*3+2].plot(X, phi_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
-        axes[i*3+2].set_xlim(xmin, xmax)
-        axes[i*3+2].set_title(f"Potential at t={time:.1f}")
-        axes[i*3+2].set_ylabel(r"$\phi$")
-        axes[i*3+2].set_xlabel("x")
-        axes[i*3+2].grid(True)
-        axes[i*3+2].legend()
+        if GRAVITY:
+            idx_phi = idx_den + 2
+            axes[idx_phi].plot(X, phi_pred0, color='c', linewidth=3, label="PINN")
+            axes[idx_phi].plot(X, phi_FD_interp, linestyle='solid', color='black', linewidth=1, label="Finite Difference")
+            axes[idx_phi].set_xlim(xmin, xmax)
+            axes[idx_phi].set_title(f"Potential at t={time:.1f}")
+            axes[idx_phi].set_ylabel(r"$\phi$")
+            axes[idx_phi].set_xlabel("x")
+            axes[idx_phi].grid(True)
+            axes[idx_phi].legend()
 
     # Set velocity y-axis limits based on amplitude (same logic as create_1d_cross_sections_sinusoidal)
     # Calculate limits from all collected velocity data and apply consistently to all velocity plots
@@ -123,7 +133,7 @@ def create_1d_comparison_plots(net, initial_params, time_array_1d=None):
     
     # Apply consistent limits to all velocity plots
     for i in range(len(time_array_1d)):
-        axes[i*3+1].set_ylim(v_liml_actual, v_limu_actual)
+        axes[i*n_cols+1].set_ylim(v_liml_actual, v_limu_actual)
 
     plt.tight_layout()
     
@@ -166,7 +176,7 @@ def create_growth_comparison_plot(net, initial_params, time_array_growth=None):
         x, rho, v, phi, n, rho_LT, rho_LT_max, rho_max_FD, v_LT = _timed_call(
             "LAX comparison slice (cpu)",
             lax_solution,
-            time, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=True, animation=True
+            time, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=True, animation=True
         )
         
         # Get PINN solution
@@ -380,13 +390,38 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
                     use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
                     if idx == 0:
                         print(f"Using GPU solver for density growth plot (CUDA available)")
-                    x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
-                        "LAX 2D (torch)",
-                        lax_solution_torch,
-                        time_val=t, N=N_GRID, nu=_get_fd_nu(), lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
-                        vel_rms=a*cs, random_seed=RANDOM_SEED
+                    Lx = lam * num_of_waves
+                    domain_params = {"Lx": Lx, "Ly": Lx, "nx": N_GRID, "ny": N_GRID}
+                    physics_params = {
+                        "c_s": cs,
+                        "rho_o": rho_o,
+                        "const": const,
+                        "G": G,
+                        "rho_1": rho_1,
+                        "lam": lam,
+                    }
+                    options = {"gravity": GRAVITY, "nu": _get_fd_nu(), "comparison": False, "isplot": False}
+                    if use_velocity_ps:
+                        ic_type = "power_spectrum"
+                        ic_params = {
+                            "power_index": POWER_EXPONENT,
+                            "amplitude": a * cs,
+                            "random_seed": RANDOM_SEED,
+                        }
+                    else:
+                        ic_type = "sinusoidal"
+                        ic_params = {"KX": KX, "KY": KY}
+                    result_2d = _timed_call(
+                        "LAX 2D (unified torch)",
+                        lax_solver_torch,
+                        time=t,
+                        domain_params=domain_params,
+                        physics_params=physics_params,
+                        ic_type=ic_type,
+                        ic_params=ic_params,
+                        options=options,
                     )
+                    rho_fd = result_2d.density
                 else:
                     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
                         if _shared_vx_np is not None and _shared_vy_np is not None:
@@ -395,21 +430,21 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
                                 "LAX 2D (shared-field cpu)",
                                 lax_solution,
                                 t, n_fd_use, _get_fd_nu(), lam, num_of_waves, rho_1,
-                                gravity=True, isplot=False, comparison=False, animation=True,
+                                gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                                 vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
                             )
                         else:
                             x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
                                 "LAX 2D (power cpu)",
                                 lax_solution,
-                                t, N_GRID, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                                t, N_GRID, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                                 use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
                             )
                     else:
                         x_fd, rho_fd, _vx_fd, _vy_fd, _phi_fd, _n, _rho_max = _timed_call(
                             "LAX 2D (sinusoidal cpu)",
                         lax_solution,
-                        t, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                        t, FD_N_2D, _get_fd_nu(), lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                             use_velocity_ps=False
                         )
                 fd_max_list.append(np.max(rho_fd))
@@ -572,18 +607,18 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
                 y_idx = np.argmin(np.abs(y_fd - y_fixed))
                 rho_fd = rho_fd_3d[:, y_idx, z_idx]
                 v_fd = vx_fd_3d[:, y_idx, z_idx]
-                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx] if phi_fd_3d is not None else None
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx] if (GRAVITY and phi_fd_3d is not None) else None
                 x_fd_line = cache_data['x']
             else:
                 x_fd_2d = cache_data['x']
                 y_fd_2d = cache_data['y']
                 rho_fd_2d = cache_data['rho']
                 vx_fd_2d = cache_data['vx']
-                _phi_fd_2d = cache_data['phi'] if cache_data['phi'] is not None else np.zeros_like(rho_fd_2d)
+                _phi_fd_2d = cache_data['phi'] if (GRAVITY and cache_data['phi'] is not None) else None
                 y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
                 rho_fd = rho_fd_2d[:, y_idx]
                 v_fd = vx_fd_2d[:, y_idx]
-                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx] if _phi_fd_2d is not None else None
                 x_fd_line = x_fd_2d
         else:
             # Compute FD data if not cached
@@ -606,7 +641,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
                 z_idx = np.argmin(np.abs(z_fd - SLICE_Z))
                 rho_fd = rho_fd_3d[:, y_idx, z_idx]
                 v_fd = vx_fd_3d[:, y_idx, z_idx]
-                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx]
+                phi_fd_slice = phi_fd_3d[:, y_idx, z_idx] if (GRAVITY and phi_fd_3d is not None) else None
                 x_fd_line = x_fd
             else:
                 if torch.cuda.is_available():
@@ -614,34 +649,62 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
                     if row_idx == 0:
                         print(f"Using GPU solver for 1D cross section plot (CUDA available)")
                     use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-                    x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, phi_fd_2d_torch, _n, _rho_max = _timed_call(
-                        "LAX 2D slice (torch)",
-                        lax_solution_torch,
-                        time_val=t, N=FD_N_2D, nu=nu_fd, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                        gravity=True, use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
-                        vel_rms=a*cs, random_seed=RANDOM_SEED
-                    )
-                    # Handle case where torch version returns None for phi (compute dummy phi if needed)
-                    if phi_fd_2d_torch is None:
-                        _phi_fd_2d = np.zeros_like(rho_fd_2d)
+                    Lx = lam * num_of_waves
+                    domain_params = {"Lx": Lx, "Ly": Lx, "nx": FD_N_2D, "ny": FD_N_2D}
+                    physics_params = {
+                        "c_s": cs,
+                        "rho_o": rho_o,
+                        "const": const,
+                        "G": G,
+                        "rho_1": rho_1,
+                        "lam": lam,
+                    }
+                    options = {"gravity": GRAVITY, "nu": nu_fd, "comparison": False, "isplot": False}
+                    if use_velocity_ps:
+                        ic_type = "power_spectrum"
+                        ic_params = {
+                            "power_index": POWER_EXPONENT,
+                            "amplitude": a * cs,
+                            "random_seed": RANDOM_SEED,
+                        }
                     else:
-                        _phi_fd_2d = phi_fd_2d_torch
+                        ic_type = "sinusoidal"
+                        ic_params = {"KX": KX, "KY": KY}
+                    result_2d = _timed_call(
+                        "LAX 2D slice (unified torch)",
+                        lax_solver_torch,
+                        time=t,
+                        domain_params=domain_params,
+                        physics_params=physics_params,
+                        ic_type=ic_type,
+                        ic_params=ic_params,
+                        options=options,
+                    )
+                    x_fd_2d = result_2d.coordinates["x"]
+                    y_fd_2d = result_2d.coordinates["y"]
+                    rho_fd_2d = result_2d.density
+                    vx_fd_2d, vy_fd_2d = result_2d.velocity_components
+                    if GRAVITY:
+                        _phi_fd_2d = result_2d.potential if result_2d.potential is not None else np.zeros_like(rho_fd_2d)
+                    else:
+                        _phi_fd_2d = None
                 else:
                     x_fd_2d, rho_fd_2d, vx_fd_2d, vy_fd_2d, _phi_fd_2d, _n, _rho_max = _timed_call(
                         "LAX 2D slice (cpu)",
                         lax_solution,
-                        t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True
+                        t, FD_N_2D, nu_fd, lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True
                     )
-                y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
+                    y_fd_2d = np.linspace(0, lam * num_of_waves, rho_fd_2d.shape[1], endpoint=False)
+                    if not GRAVITY:
+                        _phi_fd_2d = None
                 y_idx = np.argmin(np.abs(y_fd_2d - y_fixed))
                 rho_fd = rho_fd_2d[:, y_idx]
                 v_fd = vx_fd_2d[:, y_idx]
-                phi_fd_slice = _phi_fd_2d[:, y_idx]
+                phi_fd_slice = _phi_fd_2d[:, y_idx] if _phi_fd_2d is not None else None
                 x_fd_line = x_fd_2d
 
         rho_fd_interp = interp1d(x_fd_line, rho_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
         v_fd_interp = interp1d(x_fd_line, v_fd, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
-        phi_fd_interp = interp1d(x_fd_line, phi_fd_slice, kind='linear', bounds_error=False, fill_value='extrapolate')(X[:, 0])
 
         # Column index
         c = row_idx
@@ -922,51 +985,97 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
                 phi_fd = phi_vol[:, :, z_idx] if phi_vol is not None else np.zeros_like(rho_fd)
                 X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
             else:
+                y_fd = None
                 if str(PERTURBATION_TYPE).lower() == "power_spectrum":
                     if _shared_vx_np is not None and _shared_vy_np is not None:
                         x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
                             "LAX 2D (shared-field cpu)",
                             lax_solution,
                             t, N, nu, lam, num_of_waves, rho_1,
-                            gravity=True, isplot=False, comparison=False, animation=True,
+                            gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                             vx0_shared=_shared_vx_np, vy0_shared=_shared_vy_np
                         )
                     else:
                         if torch.cuda.is_available():
                             _clear_cuda_cache()
-                            x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
-                                "LAX 2D (torch)",
-                                lax_solution_torch,
-                                time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                                gravity=True, use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
+                            Lx = lam * num_of_waves
+                            domain_params = {"Lx": Lx, "Ly": Lx, "nx": N, "ny": N}
+                            physics_params = {
+                                "c_s": cs,
+                                "rho_o": rho_o,
+                                "const": const,
+                                "G": G,
+                                "rho_1": rho_1,
+                                "lam": lam,
+                            }
+                            options = {"gravity": GRAVITY, "nu": nu, "comparison": False, "isplot": False}
+                            ic_params = {
+                                "power_index": POWER_EXPONENT,
+                                "amplitude": a * cs,
+                                "random_seed": RANDOM_SEED,
+                            }
+                            result_2d = _timed_call(
+                                "LAX 2D (unified torch)",
+                                lax_solver_torch,
+                                time=t,
+                                domain_params=domain_params,
+                                physics_params=physics_params,
+                                ic_type="power_spectrum",
+                                ic_params=ic_params,
+                                options=options,
                             )
-                            phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                            x_fd = result_2d.coordinates["x"]
+                            y_fd = result_2d.coordinates["y"]
+                            rho_fd = result_2d.density
+                            vx_fd, vy_fd = result_2d.velocity_components
+                            phi_fd = result_2d.potential if result_2d.potential is not None else np.zeros_like(rho_fd)
                         else:
                             x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
                                 "LAX 2D (power cpu)",
                                 lax_solution,
-                                t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                                t, N, nu, lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                                 use_velocity_ps=True, ps_index=POWER_EXPONENT, vel_rms=a*cs, random_seed=RANDOM_SEED
                             )
                 else:
                     if torch.cuda.is_available():
                         _clear_cuda_cache()
-                        x_fd, rho_fd, vx_fd, vy_fd, phi_fd_torch, _n, _rho_max = _timed_call(
-                            "LAX 2D (torch)",
-                            lax_solution_torch,
-                            time_val=t, N=N, nu=nu, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1,
-                            gravity=True, use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
+                        Lx = lam * num_of_waves
+                        domain_params = {"Lx": Lx, "Ly": Lx, "nx": N, "ny": N}
+                        physics_params = {
+                            "c_s": cs,
+                            "rho_o": rho_o,
+                            "const": const,
+                            "G": G,
+                            "rho_1": rho_1,
+                            "lam": lam,
+                        }
+                        options = {"gravity": GRAVITY, "nu": nu, "comparison": False, "isplot": False}
+                        ic_params = {"KX": KX, "KY": KY}
+                        result_2d = _timed_call(
+                            "LAX 2D (unified torch)",
+                            lax_solver_torch,
+                            time=t,
+                            domain_params=domain_params,
+                            physics_params=physics_params,
+                            ic_type="sinusoidal",
+                            ic_params=ic_params,
+                            options=options,
                         )
-                        phi_fd = phi_fd_torch if phi_fd_torch is not None else np.zeros_like(rho_fd)
+                        x_fd = result_2d.coordinates["x"]
+                        y_fd = result_2d.coordinates["y"]
+                        rho_fd = result_2d.density
+                        vx_fd, vy_fd = result_2d.velocity_components
+                        phi_fd = result_2d.potential if result_2d.potential is not None else np.zeros_like(rho_fd)
                     else:
                         x_fd, rho_fd, vx_fd, vy_fd, phi_fd, _n, _rho_max = _timed_call(
                             "LAX 2D (sinusoidal cpu)",
                             lax_solution,
-                            t, N, nu, lam, num_of_waves, rho_1, gravity=True, isplot=False, comparison=False, animation=True,
+                            t, N, nu, lam, num_of_waves, rho_1, gravity=GRAVITY, isplot=False, comparison=False, animation=True,
                             use_velocity_ps=False, ps_index=ps_index, vel_rms=vel_rms, random_seed=random_seed
                         )
-                Lx = lam * num_of_waves
-                y_fd = np.linspace(0.0, Lx, rho_fd.shape[1], endpoint=False)
+                if y_fd is None:
+                    Lx = lam * num_of_waves
+                    y_fd = np.linspace(0.0, Lx, rho_fd.shape[1], endpoint=False)
                 X_fd, Y_fd = np.meshgrid(x_fd, y_fd, indexing='ij')
         
         if which == "density":

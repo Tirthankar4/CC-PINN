@@ -3,7 +3,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from torch.autograd import Variable
-from config import rho_o, num_neurons, num_layers, PERTURBATION_TYPE, DEFAULT_ACTIVATION, STARTUP_DT, USE_PARAMETERIZATION
+from config import (
+    rho_o,
+    num_neurons,
+    num_layers,
+    PERTURBATION_TYPE,
+    DEFAULT_ACTIVATION,
+    STARTUP_DT,
+    USE_PARAMETERIZATION,
+    GRAVITY,
+)
 
 class Sin(nn.Module):
     def forward(self, input):
@@ -70,15 +79,15 @@ class PINN(nn.Module):
         if dimension == 1:
             # 1D: periodic x features + t → [rho, vx, phi]
             in_dim = 2*self.n_harmonics + 1
-            out_dim = 3
+            out_dim = 3 if GRAVITY else 2
         elif dimension == 2:
             # 2D: periodic x,y features + t → [rho, vx, vy, phi]
             in_dim = 4*self.n_harmonics + 1
-            out_dim = 4
+            out_dim = 4 if GRAVITY else 3
         elif dimension == 3:
             # 3D: periodic x,y,z features + t → [rho, vx, vy, vz, phi]
             in_dim = 6*self.n_harmonics + 1
-            out_dim = 5
+            out_dim = 5 if GRAVITY else 4
         else:
             raise ValueError(f"Invalid dimension: {dimension}. Expected 1, 2, or 3.")
         

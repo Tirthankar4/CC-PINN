@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from core.losses import pde_residue
 from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
-from config import rho_o, PERTURBATION_TYPE, KX, KY
+from config import rho_o, PERTURBATION_TYPE, KX, KY, GRAVITY
 
 
 # ==================== Physics Calculations and Loss Functions ====================
@@ -63,12 +63,18 @@ def _compute_data_loss_unweighted(net, batch, mse_cost_function):
     outputs = net(inputs)
     num_outputs = outputs.shape[1]
 
-    if num_outputs == 3:  # 1D: [rho, vx, phi]
-        component_specs = [('rho', 0), ('vx', 1), ('phi', 2)]
-    elif num_outputs == 4:  # 2D: [rho, vx, vy, phi]
-        component_specs = [('rho', 0), ('vx', 1), ('vy', 2), ('phi', 3)]
-    elif num_outputs >= 5:  # 3D: [rho, vx, vy, vz, phi, ...]
-        component_specs = [('rho', 0), ('vx', 1), ('vy', 2), ('vz', 3), ('phi', 4)]
+    if batch.get('z') is not None:  # 3D
+        component_specs = [('rho', 0), ('vx', 1), ('vy', 2), ('vz', 3)]
+        if GRAVITY:
+            component_specs.append(('phi', 4))
+    elif batch.get('y') is not None:  # 2D
+        component_specs = [('rho', 0), ('vx', 1), ('vy', 2)]
+        if GRAVITY:
+            component_specs.append(('phi', 3))
+    elif batch.get('x') is not None:  # 1D
+        component_specs = [('rho', 0), ('vx', 1)]
+        if GRAVITY:
+            component_specs.append(('phi', 2))
     else:
         return None
 
@@ -184,18 +190,30 @@ def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
     
     # Compute PDE residuals (dimension-specific returns)
     if model.dimension == 1:
-        rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
+        if GRAVITY:
+            rho_r, vx_r, phi_r = pde_residue(colloc_shifted, net, dimension=1)
+        else:
+            rho_r, vx_r = pde_residue(colloc_shifted, net, dimension=1)
+            phi_r = None
         vy_r = vz_r = None
     elif model.dimension == 2:
-        rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
+        if GRAVITY:
+            rho_r, vx_r, vy_r, phi_r = pde_residue(colloc_shifted, net, dimension=2)
+        else:
+            rho_r, vx_r, vy_r = pde_residue(colloc_shifted, net, dimension=2)
+            phi_r = None
         vz_r = None
     else:  # dimension == 3
-        rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
+        if GRAVITY:
+            rho_r, vx_r, vy_r, vz_r, phi_r = pde_residue(colloc_shifted, net, dimension=3)
+        else:
+            rho_r, vx_r, vy_r, vz_r = pde_residue(colloc_shifted, net, dimension=3)
+            phi_r = None
     
     # Convert residuals to MSE losses
     mse_rho = torch.mean(rho_r ** 2)
     mse_velx = torch.mean(vx_r ** 2)
-    mse_phi = torch.mean(phi_r ** 2)
+    mse_phi = torch.mean(phi_r ** 2) if phi_r is not None else None
     
     mse_vely = torch.mean(vy_r ** 2) if vy_r is not None else None
     mse_velz = torch.mean(vz_r ** 2) if vz_r is not None else None
@@ -220,13 +238,15 @@ def _aggregate_losses(ic_losses, pde_losses, model):
     rho_ic_term = ic_losses['mse_rho_ic'] if isinstance(ic_losses['mse_rho_ic'], torch.Tensor) else 0.0
     
     # Base losses (all dimensions)
-    loss = ic_losses['mse_vx_ic'] + pde_losses['mse_rho'] + pde_losses['mse_velx'] + pde_losses['mse_phi'] + rho_ic_term
+    loss = ic_losses['mse_vx_ic'] + pde_losses['mse_rho'] + pde_losses['mse_velx'] + rho_ic_term
     
     # Add dimension-specific components
     if model.dimension >= 2:
         loss = loss + ic_losses['mse_vy_ic'] + pde_losses['mse_vely']
     if model.dimension == 3:
         loss = loss + ic_losses['mse_vz_ic'] + pde_losses['mse_velz']
+    if pde_losses['mse_phi'] is not None:
+        loss = loss + pde_losses['mse_phi']
     
     return loss
 
@@ -272,7 +292,7 @@ def _compute_single_batch_losses(net, mse_cost_function, batch_dom, batch_ic,
         'mse_rho_ic': ic_losses['mse_rho_ic'].item() if isinstance(ic_losses['mse_rho_ic'], torch.Tensor) else 0.0,
         'mse_rho': pde_losses['mse_rho'].item(),
         'mse_velx': pde_losses['mse_velx'].item(),
-        'mse_phi': pde_losses['mse_phi'].item(),
+        'mse_phi': pde_losses['mse_phi'].item() if pde_losses['mse_phi'] is not None else 0.0,
         'mse_vy_ic': 0.0,
         'mse_vely': 0.0,
         'mse_vz_ic': 0.0,
@@ -311,7 +331,8 @@ def _build_loss_breakdown(last_scalars, model, last_data_breakdown):
         pde_loss += last_scalars['mse_vely']
     if model.dimension == 3:
         pde_loss += last_scalars['mse_velz']
-    pde_loss += last_scalars['mse_phi']
+    if GRAVITY:
+        pde_loss += last_scalars['mse_phi']
     breakdown['PDE'] = pde_loss
 
     for label, value in last_data_breakdown.items():
