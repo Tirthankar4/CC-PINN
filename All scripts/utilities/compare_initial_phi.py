@@ -127,7 +127,7 @@ def create_initial_phi_comparison(net, model_path, N=400, nu=0.5):
     Q = N
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    XX, YY = np.meshgrid(xs, ys)
+    XX, YY = np.meshgrid(xs, ys, indexing='ij')
     grid = np.vstack([XX.flatten(), YY.flatten()]).T
     t_array = np.zeros((Q**2, 1))
     

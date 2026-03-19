@@ -11,8 +11,8 @@ Run from the project root:
     python generate_ic_bins.py
 """
 
-import sys
 import os
+import sys
 
 # ── Make sure the project root is on the path so `config` is importable ──────
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -33,23 +33,24 @@ from numerical_solvers.LAX_torch import setup_power_spectrum_ic_torch
 ps_cfg = CONFIG.power_spectrum
 domain_cfg = CONFIG.domain
 
-DIMENSION = 2                          # 2-D IC fields
+DIMENSION = 2  # 2-D IC fields
 
 # Grid
-N = ps_cfg.n_grid                      # e.g. 400
-Lx = domain_cfg.wave * domain_cfg.num_of_waves   # physical domain length
+N = ps_cfg.n_grid  # e.g. 400
+Lx = domain_cfg.wave * domain_cfg.num_of_waves  # physical domain length
 
 domain_params = {
     "Lx": Lx,
-    "Ly": Lx,   # square domain
+    "Ly": Lx,  # square domain
     "nx": N,
     "ny": N,
 }
 
 ps_params = {
-    "rho_o":       CONFIG.physics.rho_o,
+    "rho_o": CONFIG.physics.rho_o,
     "power_index": float(ps_cfg.power_exponent),
-    "amplitude":   0.1,
+    "amplitude": CONFIG.physics.a
+    * CONFIG.physics.cs,  # must match train.py: v_1 = a*cs = 1.2
     "random_seed": ps_cfg.random_seed,
 }
 
@@ -63,6 +64,9 @@ print(f"Generating {DIMENSION}D power-spectrum IC fields …")
 print(f"  Grid : {N} × {N}")
 print(f"  Domain : Lx = Ly = {Lx:.3f}")
 print(f"  Power index : {ps_params['power_index']}")
+print(
+    f"  Amplitude  : {ps_params['amplitude']}  (= a × cs = {CONFIG.physics.a} × {CONFIG.physics.cs})"
+)
 print(f"  Random seed : {ps_params['random_seed']}")
 
 ic = setup_power_spectrum_ic_torch(domain_params, ps_params, dimension=DIMENSION)

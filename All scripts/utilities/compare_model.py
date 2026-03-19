@@ -515,7 +515,7 @@ def create_comparison_plots(net, initial_params, time_points, which="density", N
         Q = N_GRID
         xs = np.linspace(xmin, xmax, Q, endpoint=False)
         ys = np.linspace(ymin, ymax, Q, endpoint=False)
-        tau, phi = np.meshgrid(xs, ys)
+        tau, phi = np.meshgrid(xs, ys, indexing='ij')
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
         
@@ -1426,7 +1426,7 @@ def create_density_pdf_plot(net, initial_params, time_points, N=None, nu=0.5, sa
         # Get PINN density field
         xs = np.linspace(xmin, xmax, Q, endpoint=False)
         ys = np.linspace(ymin, ymax, Q, endpoint=False)
-        tau, phi = np.meshgrid(xs, ys)
+        tau, phi = np.meshgrid(xs, ys, indexing='ij')
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
         

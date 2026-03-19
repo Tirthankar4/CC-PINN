@@ -92,7 +92,7 @@ def main():
     Q = rho_fd.shape[0]
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    tau, phi = np.meshgrid(xs, ys)
+    tau, phi = np.meshgrid(xs, ys, indexing='ij')
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
     t_00 = args.time * np.ones(Q**2).reshape(Q**2, 1)
     

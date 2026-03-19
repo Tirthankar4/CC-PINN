@@ -30,6 +30,7 @@ __all__ = [
     '_build_input_list',
     '_split_outputs',
     'set_shared_velocity_fields',
+    'call_unified_3d_solver',
     'get_fd_default_params',
     'compute_fd_data_cache',
     # Config values (will be imported later in this file)
@@ -264,9 +265,9 @@ def set_shared_velocity_fields(vx_np, vy_np, vz_np=None):
     _shared_vy_np = vy_np
     _shared_vz_np = vz_np
 
-def _call_unified_3d_solver(time, lam, num_of_waves, rho_1, nu=None,
-                            use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
-                            save_times=None):
+def call_unified_3d_solver(time, lam, num_of_waves, rho_1, nu=None,
+                           use_velocity_ps=None, ps_index=None, vel_rms=None, random_seed=None,
+                           save_times=None):
     """
     Helper function to call unified 3D LAX solver with proper IC type.
     
@@ -379,6 +380,9 @@ def _call_unified_3d_solver(time, lam, num_of_waves, rho_1, nu=None,
     
     return result
 
+# Backward-compatible alias for any direct module references.
+_call_unified_3d_solver = call_unified_3d_solver
+
 def get_fd_default_params():
     """
     Get default FD parameters that match PINN training configuration.
@@ -451,7 +455,7 @@ def compute_fd_data_cache(initial_params, time_points, N=200, nu=None,
     # OPTIMIZED: Run solver once to max_time with snapshots at all time points
     if DIMENSION == 3:
         # Use unified solver with snapshot support
-        results_dict = _call_unified_3d_solver(
+        results_dict = call_unified_3d_solver(
             time=max_time, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
             use_velocity_ps=use_velocity_ps, ps_index=ps_index,
             vel_rms=vel_rms, random_seed=random_seed,

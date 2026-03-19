@@ -26,8 +26,8 @@ from training.trainer import train
 # Local imports - Configuration
 from config import (
     BATCH_SIZE, NUM_BATCHES, N_0, N_r, DIMENSION,
-    a, wave, cs, xmin, ymin, zmin, tmin, 
-    tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D, 
+    a, wave, cs, xmin, ymin, zmin, tmin,
+    tmax as TMAX_CFG, iteration_adam_2D, iteration_lbgfs_2D,
     harmonics, PERTURBATION_TYPE, rho_o, SLICE_Y,
     num_neurons, num_layers, num_of_waves,
     RANDOM_SEED, STARTUP_DT,
@@ -47,28 +47,28 @@ class Experiment:
     model: ASTPN
     collocation_domain: List[torch.Tensor]
     collocation_IC: List[torch.Tensor]
-    
+
     # Optimizers
     optimizer: torch.optim.Adam
     optimizer_lbfgs: torch.optim.LBFGS
-    
+
     # Physics parameters
     physics_params: dict  # {rho_1, lam, jeans, v_1, alpha, ...}
-    
+
     # Device and loss
     device: str
     mse_cost_function: nn.MSELoss
-    
+
     # Additional metadata
     initial_params: tuple  # (xmin, xmax, ymin, ymax, rho_1, alpha, lam, "temp", tmax)
-    
+
     # Run tracking (Phase D)
     run_id: str  # Unique identifier for this run (timestamp_perturbation_dimension)
     run_dir: str  # Absolute path to run directory
-    
+
     # Velocity field interpolators (Phase E) - required for power spectrum ICs
     interpolators: Optional[VelocityFieldInterpolators] = None
-    
+
     training_diagnostics: Optional[object] = None  # Set after training completes
 
     adaptive_config: Optional[AdaptiveCollocationConfig] = None
@@ -76,43 +76,43 @@ class Experiment:
 def _generate_run_id(perturbation_type: str, dimension: int, include_hash: bool = True) -> str:
     """
     Generate a unique run ID for experiment tracking.
-    
+
     Format: {timestamp}_{perturbation_type}_{dimension}D[_{config_hash}]
     Example: 20260215_214130_power_spectrum_2D_a3f5b2c1
-    
+
     Args:
         perturbation_type: Type of perturbation (e.g., 'power_spectrum', 'sinusoidal')
         dimension: Spatial dimension (1, 2, or 3)
         include_hash: If True, append first 8 chars of config hash
-        
+
     Returns:
         Unique run identifier string
     """
     from config import CONFIG
-    
+
     # Timestamp: YYYYMMDD_HHMMSS
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     # Perturbation type: lowercase with underscores
     pert_type_clean = str(perturbation_type).lower().replace(" ", "_")
-    
+
     # Base run ID
     run_id = f"{timestamp}_{pert_type_clean}_{dimension}D"
-    
+
     # Optional: Add config hash for quick comparison
     if include_hash:
         config_dict = CONFIG.to_dict()
         config_str = str(sorted(config_dict.items()))
         config_hash = hashlib.sha256(config_str.encode()).hexdigest()[:8]
         run_id += f"_{config_hash}"
-    
+
     return run_id
 
 
 def _create_run_directory(base_dir: str, run_id: str) -> str:
     """
     Create directory structure for a training run.
-    
+
     Structure:
         base_dir/
         └── runs/
@@ -120,21 +120,21 @@ def _create_run_directory(base_dir: str, run_id: str) -> str:
                 ├── diagnostics/  (created here)
                 ├── model.pth     (saved later)
                 └── config.yaml   (saved later)
-    
+
     Args:
         base_dir: Base output directory (from config)
         run_id: Unique run identifier
-        
+
     Returns:
         Absolute path to the run directory
     """
     run_dir = os.path.join(base_dir, "runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
-    
+
     # Create subdirectories
     diagnostics_dir = os.path.join(run_dir, "diagnostics")
     os.makedirs(diagnostics_dir, exist_ok=True)
-    
+
     print(f"Created run directory: {run_dir}")
     return run_dir
 
@@ -162,7 +162,7 @@ def _save_trained_models(net, run_dir: str, adaptive_config=None):
     - ``model.pth``                        — network state dict
     - ``config.yaml``                      — full SimulationConfig
     - ``adaptive_collocation_config.json`` — only when adaptive collocation is enabled
-    
+
     Args:
         net: Trained PINN model
         run_dir: Absolute path to the run directory
@@ -173,7 +173,7 @@ def _save_trained_models(net, run_dir: str, adaptive_config=None):
 
     try:
         from config import CONFIG
-        
+
         # Save model weights to run directory
         model_path = os.path.join(run_dir, "model.pth")
         torch.save(net.state_dict(), model_path)
@@ -195,19 +195,19 @@ def _save_trained_models(net, run_dir: str, adaptive_config=None):
         print(f"Warning: failed to save model/config: {e}")
 
 
-def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None, 
-                                cached_ic_values=None, keep_models_for_vis=True, 
+def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
+                                cached_ic_values=None, keep_models_for_vis=True,
                                 target_device=None):
     """
     Comprehensive GPU memory cleanup after PINN training.
-    
+
     This function properly frees GPU memory by:
     1. Moving models to CPU (if keep_models_for_vis=True) or deleting them
     2. Deleting optimizer state (Adam momentum buffers, LBFGS history)
     3. Deleting collocation points and related tensors
     4. Deleting cached IC values
     5. Clearing PyTorch's cache allocator
-    
+
     Args:
         nets: List of neural networks (or single network in a list)
         optimizers: List of optimizers to clean up (optional)
@@ -215,18 +215,18 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
         cached_ic_values: List of cached IC value dicts to delete (optional)
         keep_models_for_vis: If True, move models to CPU instead of deleting (default: True)
         target_device: Target device for models if keep_models_for_vis=True (default: 'cpu')
-    
+
     Returns:
         None (modifies nets in-place)
     """
     if not torch.cuda.is_available():
         return
-    
+
     if target_device is None:
         target_device = 'cpu'
-    
+
     print("Starting comprehensive GPU memory cleanup...")
-    
+
     # 1. Set models to eval mode (reduces memory usage) and optionally move to CPU
     if nets is not None:
         for i, net in enumerate(nets):
@@ -237,7 +237,7 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
                 for param in net.parameters():
                     if param.grad is not None:
                         param.grad = None
-                
+
                 if keep_models_for_vis:
                     # Move to target device (usually CPU) for visualization
                     # Models can be moved back to GPU later if needed
@@ -249,7 +249,7 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
                     del net
                     nets[i] = None
                     print(f"  Deleted network {i}")
-    
+
     # 2. Delete optimizer state (can be large, especially LBFGS history)
     if optimizers is not None:
         if isinstance(optimizers, (list, tuple)):
@@ -266,7 +266,7 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
                 optimizers.param_groups.clear()
                 del optimizers
                 print("  Deleted optimizer state")
-    
+
     # 3. Delete collocation points (these can be very large)
     if collocation_data is not None:
         if isinstance(collocation_data, dict):
@@ -293,7 +293,7 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
         elif isinstance(collocation_data, torch.Tensor) and collocation_data.is_cuda:
             del collocation_data
             print("  Deleted collocation tensor")
-    
+
     # 4. Delete cached IC values
     if cached_ic_values is not None:
         if isinstance(cached_ic_values, list):
@@ -305,17 +305,17 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
                     cached_dict.clear()
             cached_ic_values.clear()
             print("  Deleted cached IC values")
-    
+
     # 5. Force garbage collection
     import gc
     gc.collect()
-    
+
     # 6. Clear PyTorch's cache allocator and synchronize
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    
+
     print("GPU memory cleanup completed")
-    
+
     # Note: If visualization needs models on GPU, they can be moved back with:
     # for net in nets:
     #     if net is not None:
@@ -325,11 +325,11 @@ def _comprehensive_gpu_cleanup(nets, optimizers=None, collocation_data=None,
 def _move_models_to_device(nets, target_device):
     """
     Move models to target device (e.g., back to GPU for visualization).
-    
+
     Args:
         nets: List of neural networks
         target_device: Target device string (e.g., 'cuda:0' or 'cpu')
-    
+
     Returns:
         None (modifies nets in-place)
     """
@@ -380,10 +380,10 @@ def _setup_device():
     has_mps = has_mps_backend()
     device = get_compute_device()
     print(f"Selected device: {device} (CUDA={has_gpu}, MPS={has_mps})")
-    
+
     if device.startswith('cuda'):
         clear_cuda_cache()
-    
+
     return device
 
 
@@ -391,18 +391,18 @@ def _compute_physics_parameters():
     """Compute domain extents and physical parameters."""
     lam, rho_1, num_waves, tmax, _, _, _ = input_taker(wave, a, num_of_waves, TMAX_CFG, N_0, 0, N_r)
     jeans, alpha = req_consts_calc(lam, rho_1)
-    
+
     # Set initial velocity amplitude per perturbation type
     if str(PERTURBATION_TYPE).lower() == "sinusoidal":
         k = 2 * np.pi / lam
         v_1 = (rho_1 / (rho_o if rho_o != 0 else 1.0)) * (alpha / k)
     else:
         v_1 = a * cs
-    
+
     xmax = xmin + lam * num_waves
     ymax = ymin + lam * num_waves
     zmax = zmin + lam * num_waves
-    
+
     return {
         'lam': lam,
         'rho_1': rho_1,
@@ -420,7 +420,7 @@ def _compute_physics_parameters():
 def _initialize_velocity_fields(lam, num_waves, v_1):
     """Initialize velocity field interpolators for power spectrum perturbations."""
     interpolators = None
-    
+
     if str(PERTURBATION_TYPE).lower() == "power_spectrum":
         if DIMENSION == 3:
             vx_np, vy_np, vz_np, interpolators = initialize_shared_velocity_fields(
@@ -430,25 +430,25 @@ def _initialize_velocity_fields(lam, num_waves, v_1):
             vx_np, vy_np, interpolators = initialize_shared_velocity_fields(
                 lam, num_waves, v_1, seed=RANDOM_SEED, dimension=2
             )
-            
+
             # Set shared velocity fields for 2D plotting
             if DIMENSION == 2:
                 from visualization.Plotting import set_shared_velocity_fields
                 set_shared_velocity_fields(vx_np, vy_np)
-    
+
     return interpolators
 
 
 def _create_model_and_optimizers(device):
     """Create PINN model and optimizers."""
     print("Running in standard PINN mode (single network)...")
-    
+
     net = PINN(dimension=DIMENSION, n_harmonics=harmonics)
     net = net.to(device)
     mse_cost_function = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     optimizerL = torch.optim.LBFGS(net.parameters(), line_search_fn='strong_wolfe')
-    
+
     return net, mse_cost_function, optimizer, optimizerL
 
 
@@ -470,7 +470,7 @@ def _generate_collocation_points(params, device):
         spatial_rmax = [params['xmax'], params['ymax'], params['zmax']]
     else:
         raise ValueError(f"Unsupported DIMENSION={DIMENSION}")
-    
+
     # Create collocation model
     collocation_model = ASTPN(
         rmin=astpn_rmin,
@@ -480,11 +480,11 @@ def _generate_collocation_points(params, device):
         N_r=N_r,
         dimension=DIMENSION
     )
-    
+
     # Generate collocation points
     collocation_IC = collocation_model.geo_time_coord(option="IC")
     collocation_domain = collocation_model.geo_time_coord(option="Domain")
-    
+
     return {
         'model': collocation_model,
         'IC': collocation_IC,
@@ -496,29 +496,29 @@ def _generate_collocation_points(params, device):
 def build_experiment() -> Experiment:
     """
     Build complete experiment by coordinating setup of all components.
-    
+
     Returns:
         Experiment: Container with all experiment state
     """
     # Device setup
     device = _setup_device()
-    
+
     # Physics parameters and domain bounds
     params = _compute_physics_parameters()
-    
+
     # Velocity field interpolators (power spectrum only)
     interpolators = _initialize_velocity_fields(params['lam'], params['num_waves'], params['v_1'])
-    
+
     # Model and optimizers
     net, mse_cost_function, optimizer, optimizerL = _create_model_and_optimizers(device)
-    
+
     # Collocation points
     collocation = _generate_collocation_points(params, device)
-    
+
     # Set periodic boundary conditions via domain
     spatial_rmin, spatial_rmax = collocation['spatial_bounds']
     net.set_domain(rmin=spatial_rmin, rmax=spatial_rmax, dimension=DIMENSION)
-    
+
     # Run tracking
     from config import SNAPSHOT_DIR, CONFIG
     run_id = _generate_run_id(PERTURBATION_TYPE, DIMENSION, include_hash=True)
@@ -559,7 +559,7 @@ def build_experiment() -> Experiment:
 def run_training(experiment: Experiment) -> None:
     """
     Run training: calls the training function (currently train()).
-    
+
     Args:
         experiment: Experiment container with all necessary state
     """
@@ -583,7 +583,7 @@ def run_training(experiment: Experiment) -> None:
 def post_training(experiment: Experiment) -> None:
     """
     Post-training: model saving, GPU cleanup, diagnostics, visualization.
-    
+
     Args:
         experiment: Experiment container with all necessary state
     """
@@ -653,6 +653,18 @@ def post_training(experiment: Experiment) -> None:
             print("Training completed successfully, but diagnostic plots may be incomplete.")
             import traceback
             traceback.print_exc()
+
+    from config import TRAINING_ONLY
+    if TRAINING_ONLY:
+        print("\n" + "=" * 70)
+        print("training_only=True: skipping all post-training visualization.")
+        print("Model and config have been saved. Download from run directory.")
+        print("=" * 70 + "\n")
+        # Still do final cache cleanup
+        script_root = os.path.dirname(os.path.abspath(__file__))
+        print("Performing final Python cache cleanup...")
+        clean_pycache(script_root)
+        return
 
     # ==================== VISUALIZATION ====================
     from visualization.Plotting import (
@@ -733,4 +745,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

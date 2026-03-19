@@ -341,7 +341,7 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
     Q = N_GRID
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    TAU, PHI = np.meshgrid(xs, ys)
+    TAU, PHI = np.meshgrid(xs, ys, indexing='ij')
     if DIMENSION >= 3:
         ZETA = np.full_like(TAU, SLICE_Z)
     Xgrid = np.vstack([TAU.flatten(), PHI.flatten()]).T
@@ -368,7 +368,7 @@ def create_density_growth_plot(net, initial_params, tmax, dt=0.1):
             else:
                 # Fallback: compute on the fly if cache miss (shouldn't happen)
                 use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-                result = _call_unified_3d_solver(
+                result = call_unified_3d_solver(
                     time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=_get_fd_nu(),
                     use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
                     vel_rms=a*cs, random_seed=RANDOM_SEED
@@ -625,7 +625,7 @@ def create_1d_cross_sections_sinusoidal(net, initial_params, time_points=None, y
             if DIMENSION == 3:
                 # Use unified solver with proper IC type support
                 use_velocity_ps = (str(PERTURBATION_TYPE).lower() == "power_spectrum")
-                result = _call_unified_3d_solver(
+                result = call_unified_3d_solver(
                     time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu_fd,
                     use_velocity_ps=use_velocity_ps, ps_index=POWER_EXPONENT,
                     vel_rms=a*cs, random_seed=RANDOM_SEED
@@ -880,7 +880,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
         Q = N_GRID
         xs = np.linspace(xmin, xmax, Q, endpoint=False)
         ys = np.linspace(ymin, ymax, Q, endpoint=False)
-        tau, phi = np.meshgrid(xs, ys) 
+        tau, phi = np.meshgrid(xs, ys, indexing='ij')
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         t_00 = t * np.ones(Q**2).reshape(Q**2, 1)
         
@@ -966,7 +966,7 @@ def create_5x3_comparison_table(net, initial_params, which="density", N=200, nu=
             # Compute FD data if not cached
             if DIMENSION == 3:
                 # Use unified solver with proper IC type support
-                result = _call_unified_3d_solver(
+                result = call_unified_3d_solver(
                     time=t, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
                     use_velocity_ps=use_velocity_ps, ps_index=ps_index,
                     vel_rms=vel_rms, random_seed=random_seed

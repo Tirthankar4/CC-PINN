@@ -40,7 +40,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
     Q = N_GRID
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    tau, phi = np.meshgrid(xs, ys)
+    tau, phi = np.meshgrid(xs, ys, indexing='ij')
     if DIMENSION >= 3:
         zeta = np.full_like(tau, SLICE_Z)
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
@@ -80,7 +80,7 @@ def create_2d_animation(net, initial_params, time_points=None, which="density", 
         Q = N_GRID
         xs = np.linspace(xmin, xmax, Q, endpoint=False)
         ys = np.linspace(ymin, ymax, Q, endpoint=False)
-        tau, phi = np.meshgrid(xs, ys)
+        tau, phi = np.meshgrid(xs, ys, indexing='ij')
         Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
         # First frame
         t_first = time_points[0] * np.ones(Q**2).reshape(Q**2, 1)

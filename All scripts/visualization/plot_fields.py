@@ -152,7 +152,7 @@ def Two_D_surface_plots(net, time, initial_params, ax=None, which="density", fd_
     Q = N_GRID
     xs = np.linspace(xmin, xmax, Q, endpoint=False)
     ys = np.linspace(ymin, ymax, Q, endpoint=False)
-    tau, phi = np.meshgrid(xs, ys) 
+    tau, phi = np.meshgrid(xs, ys, indexing='ij')
     Xgrid = np.vstack([tau.flatten(), phi.flatten()]).T
     t_00 = time * np.ones(Q**2).reshape(Q**2, 1)
     
@@ -294,7 +294,7 @@ def Two_D_surface_plots_FD(time, initial_params, N=200, nu=None, ax=None, which=
         #   x (Nx,), rho (Nx,Ny), vx (Nx,Ny), vy (Nx,Ny), phi (Nx,Ny), n, rho_max
         if DIMENSION == 3:
             # Use unified solver with proper IC type support
-            result = _call_unified_3d_solver(
+            result = call_unified_3d_solver(
                 time=time, lam=lam, num_of_waves=num_of_waves, rho_1=rho_1, nu=nu,
                 use_velocity_ps=use_velocity_ps, ps_index=ps_index,
                 vel_rms=vel_rms, random_seed=random_seed
