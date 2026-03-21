@@ -15,16 +15,19 @@ import sys
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from pathlib import Path
 from scipy.interpolate import RegularGridInterpolator
 from torch.autograd import Variable
 
-MODEL_PATH = r"C:\Users\tirth\OneDrive\Desktop\gravitational collapse results\With Athena\2D power spectrum\Supersonic\Seed 4\t = 0.6\Baseline\model.pth"
+MODEL_PATH = r"C:\Users\tirth\Downloads\model.pth"
 OUTPUT_DENSITY = r"C:\Users\tirth\OneDrive\Desktop\grinn_vs_athena_density_new.png"
 OUTPUT_VELOCITY = r"C:\Users\tirth\OneDrive\Desktop\grinn_vs_athena_velocity_new.png"
 
-PROJECT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT)
-os.chdir(PROJECT)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+os.chdir(str(PROJECT_ROOT))
 
 from config import (
     xmin, ymin, wave, a, cs, harmonics,
@@ -40,7 +43,7 @@ print(f"Device: {device}")
 # ---------------------------------------------------------------------------
 # 1. Load Athena cache saved by step1
 # ---------------------------------------------------------------------------
-cache_dir = os.path.join(PROJECT, "athena_cache")
+cache_dir = os.path.join(str(SCRIPT_DIR), "athena_cache")
 if not os.path.isdir(cache_dir):
     sys.exit("ERROR: athena_cache/ folder not found. Run step1_extract_athena.py in WSL first.")
 
@@ -177,9 +180,10 @@ def _make_figure(rows_data, field_pinn_key, field_ath_key,
         axes = axes.reshape(1, -1)
 
     # ------------------------------------------------------------------
-    # Shared colour scales across ALL timestep rows.
+    # Colour scales: columns 1 & 2 are auto-scaled per row by matplotlib.
+    # Columns 3 & 4 follow the same dynamic-per-row philosophy:
     #
-    # |eps| panel  -> sequential "YlOrRd", vmin=0, vmax=global 99th pct.
+    # |eps| panel  -> sequential "YlOrRd", vmin=0, vmax=row 99th pct.
     #   Correct for a strictly non-negative quantity. Diverging maps
     #   (e.g. "coolwarm") waste the blue half and produce a grey panel
     #   when errors are near zero.
@@ -191,12 +195,6 @@ def _make_figure(rows_data, field_pinn_key, field_ath_key,
     #   the "double-penalty" effect that explains how a model can have
     #   higher eps despite its amplitude range looking closer to Athena.
     # ------------------------------------------------------------------
-    all_eps  = np.concatenate([d[eps_key ].ravel() for d in rows_data])
-    all_diff = np.concatenate([d[diff_key].ravel() for d in rows_data])
-    eps_vmax  = np.percentile(all_eps, 99)
-    diff_vlim = np.percentile(np.abs(all_diff), 99)
-    print(f"  |eps| scale  : 0 - {eps_vmax:.1f}%  (global 99th pct)")
-    print(f"  diff scale : +/-{diff_vlim:.1f}%  (global 99th pct of |diff|)")
 
     for row, d in enumerate(rows_data):
         t         = d["t"]
@@ -207,14 +205,19 @@ def _make_figure(rows_data, field_pinn_key, field_ath_key,
         med_eps   = np.median(eps)
         p90_eps   = np.percentile(eps, 90)
 
+        # Per-row dynamic colour ranges (mirrors columns 1 & 2 behaviour)
+        row_eps_vmax  = np.percentile(eps, 99)
+        row_diff_vlim = np.percentile(np.abs(diff), 99)
+        print(f"  t={t:.3f}  |eps| scale: 0-{row_eps_vmax:.1f}%  diff scale: +/-{row_diff_vlim:.1f}%  (row 99th pct)")
+
         skip = max(1, Q // 20)
         sk   = (slice(None, None, skip), slice(None, None, skip))
 
         cols_spec = [
             (pinn_data, f"GRINN  t={t:.2f}",           cmap,     {}),
             (ath_data,  f"Athena++  t={t:.2f}",         cmap,     {}),
-            (eps,       f"|eps| (%)  t={t:.2f}",         "YlOrRd", {"vmin": 0,           "vmax": eps_vmax }),
-            (diff,      f"GRINN-Athena (%)  t={t:.2f}", "RdBu_r", {"vmin": -diff_vlim,  "vmax": diff_vlim}),
+            (eps,       f"|eps| (%)  t={t:.2f}",         "YlOrRd", {"vmin": 0,                "vmax": row_eps_vmax }),
+            (diff,      f"GRINN-Athena (%)  t={t:.2f}", "RdBu_r", {"vmin": -row_diff_vlim,   "vmax": row_diff_vlim}),
         ]
 
         for col, (data, title, cm, kwargs) in enumerate(cols_spec):

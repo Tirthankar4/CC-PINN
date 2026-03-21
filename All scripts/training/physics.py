@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from core.losses import pde_residue
 from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
-from config import rho_o, PERTURBATION_TYPE, KX, KY, GRAVITY
+from config import rho_o, PERTURBATION_TYPE, KX, KY, GRAVITY, PDE_TIME_WEIGHT_ALPHA
 
 
 # ==================== Physics Calculations and Loss Functions ====================
@@ -180,14 +180,17 @@ def _compute_ic_losses(net, batch_ic, model, rho_1, lam, jeans, v_1, mse_cost_fu
 def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
     """
     Compute PDE residual losses for all equations (continuity, momentum, Poisson).
-    
+
+    Each squared residual is weighted by exp(alpha * t) before averaging, where
+    alpha = PDE_TIME_WEIGHT_ALPHA from config.  alpha=0 reduces to plain MSE.
+
     Returns:
         Dict with MSE losses for each PDE component
     """
     # Ensure batch_dom is in list format for pde_residue
     colloc_shifted = list(batch_dom) if isinstance(batch_dom, (list, tuple)) else \
                      [batch_dom[:, i:i+1] for i in range(batch_dom.shape[1])]
-    
+
     # Compute PDE residuals (dimension-specific returns)
     if model.dimension == 1:
         if GRAVITY:
@@ -209,21 +212,37 @@ def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
         else:
             rho_r, vx_r, vy_r, vz_r = pde_residue(colloc_shifted, net, dimension=3)
             phi_r = None
-    
-    # Convert residuals to MSE losses
-    mse_rho = torch.mean(rho_r ** 2)
-    mse_velx = torch.mean(vx_r ** 2)
-    mse_phi = torch.mean(phi_r ** 2) if phi_r is not None else None
-    
-    mse_vely = torch.mean(vy_r ** 2) if vy_r is not None else None
-    mse_velz = torch.mean(vz_r ** 2) if vz_r is not None else None
-    
+
+    # ── Exponential time-weighting ──────────────────────────────────────────
+    # t is always the last element of colloc_shifted.
+    # weights shape: [N, 1], matching residual tensors.
+    # When alpha=0 all weights are 1 and the result is plain MSE.
+    alpha = PDE_TIME_WEIGHT_ALPHA
+    if alpha != 0.0:
+        t_colloc = colloc_shifted[-1]          # [N, 1]
+        weights  = torch.exp(alpha * t_colloc) # [N, 1]
+        # Normalise so the mean weight is 1 (keeps loss magnitude comparable
+        # across different alpha values and time windows).
+        weights  = weights / (weights.mean() + 1e-12)
+        def _wmse(r):
+            return torch.mean(weights * r ** 2)
+    else:
+        def _wmse(r):
+            return torch.mean(r ** 2)
+
+    # Convert residuals to (weighted) MSE losses
+    mse_rho  = _wmse(rho_r)
+    mse_velx = _wmse(vx_r)
+    mse_phi  = _wmse(phi_r) if phi_r is not None else None
+    mse_vely = _wmse(vy_r)  if vy_r  is not None else None
+    mse_velz = _wmse(vz_r)  if vz_r  is not None else None
+
     return {
-        'mse_rho': mse_rho,
+        'mse_rho':  mse_rho,
         'mse_velx': mse_velx,
         'mse_vely': mse_vely,
         'mse_velz': mse_velz,
-        'mse_phi': mse_phi,
+        'mse_phi':  mse_phi,
     }
 
 

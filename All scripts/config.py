@@ -32,7 +32,7 @@ class PhysicsConfig:
     rho_o: float = 1.0  # Background density
     const: float = 1.0  # Poisson coupling constant (4πG)
     G: float = 1.0  # Gravitational constant
-    a: float = 1.2  # Perturbation amplitude
+    a: float = 0.1  # Perturbation amplitude
     gravity: bool = True # Enable/disable self-gravity coupling
 
 
@@ -45,7 +45,7 @@ class DomainConfig:
     ymin: float = 0.0
     zmin: float = 0.0
     tmin: float = 0.0
-    tmax: float = 0.6
+    tmax: float = 3.0
     wave: float = 7.0  # Wavelength
     num_of_waves: float = 2.0  # Number of wavelengths in domain
 
@@ -68,6 +68,12 @@ class TrainingConfig:
     ic_weight: float = 1.0  # IC loss weight
     # Causality
     startup_dt: float = 0.01  # PDE enforcement delay
+    # Exponential time-weighting of PDE residuals:
+    #   L_PDE = mean( exp(alpha * t) * r^2 )
+    # alpha = 0.0 → standard unweighted MSE (default, no behaviour change).
+    # alpha > 0  → late times weighted more heavily (tracks exponential growth).
+    # alpha < 0  → early times weighted more heavily (penalises seed errors).
+    pde_time_weight_alpha: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -133,7 +139,7 @@ class PowerSpectrumConfig:
     n_grid_3d: int = 400
     fd_nu_power: float = 0.25
     power_exponent: int = -4
-    random_seed: int = 4  # Seed for IC field generation (big impact on field morphology)
+    random_seed: int = 82  # Seed for IC field generation (big impact on field morphology)
 
 
 @dataclass(frozen=True)
@@ -309,6 +315,7 @@ iteration_adam_2D = CONFIG.training.iteration_adam
 iteration_lbgfs_2D = CONFIG.training.iteration_lbfgs
 IC_WEIGHT = CONFIG.training.ic_weight
 STARTUP_DT = CONFIG.training.startup_dt
+PDE_TIME_WEIGHT_ALPHA = CONFIG.training.pde_time_weight_alpha
 
 # --- Model ---
 num_neurons = CONFIG.model.num_neurons

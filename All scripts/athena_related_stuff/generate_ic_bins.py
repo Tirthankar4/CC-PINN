@@ -13,11 +13,13 @@ Run from the project root:
 
 import os
 import sys
+from pathlib import Path
 
-# ── Make sure the project root is on the path so `config` is importable ──────
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# ── Resolve paths after moving this script under athena_related_stuff/ ───────
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 
@@ -55,7 +57,7 @@ ps_params = {
 }
 
 # Output directory (same folder as this script)
-OUT_DIR = ROOT
+OUT_DIR = str(SCRIPT_DIR)
 
 # =============================================================================
 # Generate IC fields

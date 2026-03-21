@@ -14,15 +14,18 @@ so step2 can read them directly from Windows Python).
 import os
 import sys
 import numpy as np
+from pathlib import Path
 
-ATHENA_DATA_DIR = "/home/Aboba/test/data_for_grinn/2d_supercritical/seed_4"
+ATHENA_DATA_DIR = "/home/Aboba/test/data_for_grinn/2d_subcritical/seed_82"
 ATHENA_OUTPUT_ID = "external2d.out1"
-TIME_POINTS = [0.00, 0.15, 0.30, 0.45, 0.60]
+TIME_POINTS = [0.0, 0.75, 1.5, 2.25, 3.00]
 TIME_TOL = 0.2
 
-PROJECT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT)
-os.chdir(PROJECT)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+os.chdir(str(PROJECT_ROOT))
 
 from numerical_solvers.athena_reader import build_athena_cache
 
@@ -33,7 +36,7 @@ cache = build_athena_cache(
     time_tol=TIME_TOL,
 )
 
-out_dir = os.path.join(PROJECT, "athena_cache")
+out_dir = os.path.join(str(SCRIPT_DIR), "athena_cache")
 os.makedirs(out_dir, exist_ok=True)
 
 times = sorted(cache.keys())
