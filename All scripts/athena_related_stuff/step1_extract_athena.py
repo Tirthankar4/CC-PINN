@@ -18,7 +18,7 @@ from pathlib import Path
 
 ATHENA_DATA_DIR = "/home/Aboba/test/data_for_grinn/2d_subcritical/seed_82"
 ATHENA_OUTPUT_ID = "external2d.out1"
-TIME_POINTS = [0.0, 0.75, 1.5, 2.25, 3.00]
+TIME_POINTS = [0.0, 1.25, 2.5, 3.75, 5.00]
 TIME_TOL = 0.2
 
 SCRIPT_DIR = Path(__file__).resolve().parent

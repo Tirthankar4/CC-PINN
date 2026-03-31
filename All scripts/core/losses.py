@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-from config import cs, const, G, rho_o, GRAVITY
+from config import cs, const, G, rho_o, GRAVITY, USE_TEMPORAL_REPARAM, JEANS_GROWTH_RATE
 
 class ASTPN(col_gen):
     
@@ -40,7 +40,22 @@ def pde_residue(colloc, net, dimension = 1):
 def pde_residue_standard(colloc, net, dimension = 1):
     
     '''
-    Standard PDE residues (network predicts rho directly)
+    Standard PDE residues (network predicts rho directly).
+
+    Temporal reparameterization — Jacobian correction
+    --------------------------------------------------
+    When USE_TEMPORAL_REPARAM is True the network receives
+        τ = (exp(ω_J * t) - 1) / ω_J
+    as its time input.  torch.autograd.grad(output, t) therefore
+    returns d(output)/dτ * dτ/dt = d(output)/dτ * exp(ω_J * t),
+    i.e. the raw autograd value is the physical derivative already
+    multiplied by the Jacobian J(t) = exp(ω_J * t).
+
+    To recover the physical time derivative we divide by J(t):
+        d(output)/dt_physical = autograd(output, t) / J(t)
+
+    Spatial derivatives are unaffected (coords unchanged).
+    Poisson equation has no time derivatives — also unaffected.
     '''
     net_outputs = net(colloc)
     
@@ -57,7 +72,32 @@ def pde_residue_standard(colloc, net, dimension = 1):
         y = colloc[1]
         z = colloc[2]
         t = colloc[3]
-    
+
+    # Jacobian J(t) = dτ/dt = exp(ω_J * t).
+    # When reparam is off J = 1, so _dt reduces to a plain diff call.
+    if USE_TEMPORAL_REPARAM and JEANS_GROWTH_RATE > 0.0:
+        import math
+        from config import tmax as TMAX_CFG
+        t_col = t.unsqueeze(-1) if t.dim() == 1 else t
+        # _temporal_reparam normalises tau so that tau(tmax) = tmax.
+        # The actual mapping is tau_norm = (exp(omega*t)-1) / (omega*scale)
+        # where scale = tau_raw(tmax)/tmax.
+        # Therefore d(tau_norm)/dt = exp(omega*t) / scale.
+        omega    = float(JEANS_GROWTH_RATE)
+        tmax_val = float(TMAX_CFG)
+        tau_max_val = (math.exp(omega * tmax_val) - 1.0) / omega
+        scale = tau_max_val / tmax_val if tmax_val > 0.0 else 1.0
+        jacobian = torch.exp(torch.clamp(omega * t_col, max=20.0)) / scale
+    else:
+        jacobian = None
+
+    def _dt(field):
+        """Time derivative, Jacobian-corrected when reparam is active."""
+        raw = diff(field, t, order=1)
+        if jacobian is not None:
+            return raw / jacobian
+        return raw
+
     rho, vx = net_outputs[:,0:1], net_outputs[:,1:2]
 
     if dimension == 1:
@@ -65,10 +105,10 @@ def pde_residue_standard(colloc, net, dimension = 1):
         if GRAVITY:
             phi = net_outputs[:,2:3]
 
-        rho_t = diff(rho,t,order=1)  
+        rho_t = _dt(rho)
         rho_x = diff(rho,x,order=1)
 
-        vx_t = diff(vx, t,order=1)
+        vx_t = _dt(vx)
         vx_x = diff(vx, x,order=1)
         
         if GRAVITY:
@@ -81,12 +121,12 @@ def pde_residue_standard(colloc, net, dimension = 1):
         if GRAVITY:
             phi = net_outputs[:,3:4]
 
-        rho_t = diff(rho,t,order=1)  
+        rho_t = _dt(rho)
         rho_x = diff(rho,x,order=1)
         rho_y = diff(rho,y,order=1)
 
-        vx_t = diff(vx, t,order=1)
-        vy_t = diff(vy, t,order=1)
+        vx_t = _dt(vx)
+        vy_t = _dt(vy)
 
         vx_x = diff(vx, x,order=1)
         vx_y = diff(vx, y,order=1)
@@ -106,14 +146,14 @@ def pde_residue_standard(colloc, net, dimension = 1):
         if GRAVITY:
             phi = net_outputs[:,4:5]
 
-        rho_t = diff(rho,t,order=1)  
+        rho_t = _dt(rho)
         rho_x = diff(rho,x,order=1)
         rho_y = diff(rho,y,order=1)
         rho_z = diff(rho,z,order=1)
 
-        vx_t = diff(vx, t,order=1)
-        vy_t = diff(vy, t,order=1)
-        vz_t = diff(vz, t,order=1)
+        vx_t = _dt(vx)
+        vy_t = _dt(vy)
+        vz_t = _dt(vz)
 
         vx_x = diff(vx, x,order=1)
         vy_x = diff(vy, x,order=1)

@@ -22,6 +22,7 @@ PRIORITY_MODULES = [
     "core.losses",
     "core.model_architecture",
     "methods.adaptive_collocation",
+    "methods.causal_training",
     "methods.temporal_splitting",
     "training.training_diagnostics",
     "training.physics",

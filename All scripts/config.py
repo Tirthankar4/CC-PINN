@@ -85,6 +85,10 @@ class ModelConfig:
     harmonics: int = 3  # Fourier feature harmonics
     activation: str = "sin"  # Activation function
     use_parameterization: str = "exponential"  # Density parameterization
+    # Backward-compatible controls for optional time reparameterization.
+    # Default values keep behavior unchanged unless explicitly enabled.
+    use_temporal_reparam: bool = False
+    jeans_growth_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -153,6 +157,46 @@ class AdaptiveCollocationConfig:
     uniform_fraction: float = 0.2  # Fraction replaced with fresh uniform points
 
 
+@dataclass(frozen=True)
+class CausalTrainingConfig:
+    """
+    Causal training parameters (Wang et al. 2022).
+
+    Enforces temporal ordering of learning: late-time PDE residuals receive
+    suppressed gradient signal until early-time residuals are already small.
+    This prevents the low-lying rotating solution from winning at large t_max
+    by satisfying late-time residuals without correct early-time dynamics.
+
+    Weight formula (bin-based approximation):
+        w(t_i) = exp( -epsilon * cumulative_loss(t < t_i) )
+    normalised so mean(w) = 1.
+
+    Parameters
+    ----------
+    enabled : bool
+        Master toggle.  False → no-op, plain MSE used instead.
+    epsilon : float
+        Causal sharpness.  Larger ε → stronger suppression of late-time
+        points when early-time residuals are large.  Typical range: 1–10.
+        Start with 5.0; increase if the wrong solution still dominates.
+    n_time_bins : int
+        Number of time bins for the cumulative approximation.  More bins
+        give a finer temporal resolution at the cost of a small inner loop.
+        20–50 is sufficient for most cases.
+    activate_after_iter : int
+        Delay causal weighting until this many Adam iterations have passed.
+        Useful when all residuals are initially large (iter 0) and causal
+        weights would suppress everything — give Adam a few hundred steps to
+        reduce the overall loss first.  0 = active from the first iteration.
+        Causal weights are always active during L-BFGS regardless of this.
+    """
+
+    enabled: bool = True
+    epsilon: float = 5.0
+    n_time_bins: int = 20
+    activate_after_iter: int = 0
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Top-level configuration
 # ═══════════════════════════════════════════════════════════════
@@ -188,6 +232,9 @@ class SimulationConfig:
     power_spectrum: PowerSpectrumConfig = field(default_factory=PowerSpectrumConfig)
     adaptive_collocation: AdaptiveCollocationConfig = field(
         default_factory=AdaptiveCollocationConfig
+    )
+    causal_training: CausalTrainingConfig = field(
+        default_factory=CausalTrainingConfig
     )
 
     # ── Derived / resolved values ──────────────────────────────
@@ -323,6 +370,8 @@ num_layers = CONFIG.model.num_layers
 harmonics = CONFIG.model.harmonics
 DEFAULT_ACTIVATION = CONFIG.model.activation
 USE_PARAMETERIZATION = CONFIG.model.use_parameterization
+USE_TEMPORAL_REPARAM = CONFIG.model.use_temporal_reparam
+JEANS_GROWTH_RATE = CONFIG.model.jeans_growth_rate
 
 # --- Visualization / output ---
 SAVE_STATIC_SNAPSHOTS = CONFIG.visualization.save_static_snapshots
@@ -357,3 +406,6 @@ POWER_EXPONENT = CONFIG.power_spectrum.power_exponent
 
 # --- Adaptive collocation ---
 ADAPTIVE_COLLOCATION = CONFIG.adaptive_collocation
+
+# --- Causal training ---
+CAUSAL_TRAINING = CONFIG.causal_training

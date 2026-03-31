@@ -37,7 +37,7 @@ from config import (
     ENABLE_INTERACTIVE_3D, INTERACTIVE_3D_RESOLUTION, INTERACTIVE_3D_TIME_STEPS
 )
 
-from config import AdaptiveCollocationConfig
+from config import AdaptiveCollocationConfig, CausalTrainingConfig
 
 @dataclass
 class Experiment:
@@ -72,6 +72,7 @@ class Experiment:
     training_diagnostics: Optional[object] = None  # Set after training completes
 
     adaptive_config: Optional[AdaptiveCollocationConfig] = None
+    causal_config: Optional[CausalTrainingConfig] = None
 
 def _generate_run_id(perturbation_type: str, dimension: int, include_hash: bool = True) -> str:
     """
@@ -530,6 +531,13 @@ def build_experiment() -> Experiment:
     if adaptive_config is not None:
         print(f"[AdaptiveColloc] Enabled — resampling every {adaptive_config.resample_every_n} Adam iterations")
 
+    # Causal training config
+    causal_config = CONFIG.causal_training if CONFIG.causal_training.enabled else None
+    if causal_config is not None:
+        print(f"[CausalTraining] Enabled — ε={causal_config.epsilon}, "
+              f"bins={causal_config.n_time_bins}, "
+              f"activate_after={causal_config.activate_after_iter} Adam iterations")
+
     # Build experiment container
     return Experiment(
         net=net,
@@ -553,6 +561,7 @@ def build_experiment() -> Experiment:
         run_dir=run_dir,
         interpolators=interpolators,
         adaptive_config=adaptive_config,
+        causal_config=causal_config,
     )
 
 

@@ -4,6 +4,7 @@ import torch
 from core.losses import pde_residue
 from core.initial_conditions import fun_rho_0, fun_vx_0, fun_vy_0, fun_vz_0
 from config import rho_o, PERTURBATION_TYPE, KX, KY, GRAVITY, PDE_TIME_WEIGHT_ALPHA
+from methods.causal_training import compute_causal_weights
 
 
 # ==================== Physics Calculations and Loss Functions ====================
@@ -177,12 +178,25 @@ def _compute_ic_losses(net, batch_ic, model, rho_1, lam, jeans, v_1, mse_cost_fu
     }
 
 
-def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
+def _compute_pde_losses(net, batch_dom, model, mse_cost_function,
+                        causal_config=None, iteration=None):
     """
     Compute PDE residual losses for all equations (continuity, momentum, Poisson).
 
-    Each squared residual is weighted by exp(alpha * t) before averaging, where
-    alpha = PDE_TIME_WEIGHT_ALPHA from config.  alpha=0 reduces to plain MSE.
+    When causal_config.enabled is True and the iteration threshold has been
+    reached, per-point causal weights are applied before reducing residuals to
+    MSE.  The weights enforce temporal ordering of learning: late-time points
+    are suppressed until early-time residuals are already small.
+
+    pde_time_weight_alpha (exponential time weighting) is treated as inactive
+    (alpha=0) since it has been superseded by causal training.  The alpha path
+    is preserved in code but not used when causal training is on.
+
+    Args:
+        causal_config : CausalTrainingConfig or None.  None → plain MSE.
+        iteration     : Current training iteration (int) or None.
+                        None means "always apply causal weights if enabled"
+                        (used during L-BFGS where there is no iteration count).
 
     Returns:
         Dict with MSE losses for each PDE component
@@ -213,29 +227,55 @@ def _compute_pde_losses(net, batch_dom, model, mse_cost_function):
             rho_r, vx_r, vy_r, vz_r = pde_residue(colloc_shifted, net, dimension=3)
             phi_r = None
 
-    # ── Exponential time-weighting ──────────────────────────────────────────
-    # t is always the last element of colloc_shifted.
-    # weights shape: [N, 1], matching residual tensors.
-    # When alpha=0 all weights are 1 and the result is plain MSE.
-    alpha = PDE_TIME_WEIGHT_ALPHA
-    if alpha != 0.0:
-        t_colloc = colloc_shifted[-1]          # [N, 1]
-        weights  = torch.exp(alpha * t_colloc) # [N, 1]
-        # Normalise so the mean weight is 1 (keeps loss magnitude comparable
-        # across different alpha values and time windows).
-        weights  = weights / (weights.mean() + 1e-12)
+    # ── Weighting strategy ───────────────────────────────────────────────────
+    # Priority: causal training > plain MSE.
+    # pde_time_weight_alpha is kept at 0 and not applied.
+    #
+    # Causal weights are active when:
+    #   (a) causal_config is provided and enabled, AND
+    #   (b) iteration is None (L-BFGS, always active) OR
+    #       iteration >= causal_config.activate_after_iter
+    t_colloc = colloc_shifted[-1]   # [N, 1], raw physical time
+
+    use_causal = (
+        causal_config is not None
+        and causal_config.enabled
+        and (iteration is None or iteration >= causal_config.activate_after_iter)
+    )
+
+    if use_causal:
+        # Gather all active residuals for the total-residual score used
+        # to compute bin losses.  None entries (unused equations) are skipped
+        # inside compute_causal_weights.
+        all_residuals = [rho_r, vx_r, vy_r, vz_r, phi_r]
+        weights = compute_causal_weights(all_residuals, t_colloc, causal_config)
+
         def _wmse(r):
+            if r is None:
+                return None
             return torch.mean(weights * r ** 2)
     else:
         def _wmse(r):
+            if r is None:
+                return None
             return torch.mean(r ** 2)
 
     # Convert residuals to (weighted) MSE losses
     mse_rho  = _wmse(rho_r)
     mse_velx = _wmse(vx_r)
-    mse_phi  = _wmse(phi_r) if phi_r is not None else None
-    mse_vely = _wmse(vy_r)  if vy_r  is not None else None
-    mse_velz = _wmse(vz_r)  if vz_r  is not None else None
+    mse_phi  = _wmse(phi_r)
+    mse_vely = _wmse(vy_r)
+    mse_velz = _wmse(vz_r)
+
+    # Log causal status once per run (first call only)
+    if not getattr(_compute_pde_losses, '_causal_logged', False):
+        _compute_pde_losses._causal_logged = True
+        if use_causal:
+            print(f"[CausalTraining] Active — ε={causal_config.epsilon}, "
+                  f"bins={causal_config.n_time_bins}, "
+                  f"activate_after={causal_config.activate_after_iter}", flush=True)
+        else:
+            print("[CausalTraining] Inactive — using plain MSE", flush=True)
 
     return {
         'mse_rho':  mse_rho,
@@ -272,7 +312,8 @@ def _aggregate_losses(ic_losses, pde_losses, model):
 
 def _compute_single_batch_losses(net, mse_cost_function, batch_dom, batch_ic,
                                   model, rho_1, lam, jeans, v_1,
-                                  num_effective_batches, data_terms, interpolators=None):
+                                  num_effective_batches, data_terms, interpolators=None,
+                                  causal_config=None, iteration=None):
     """
     Computes IC loss + PDE residuals + loss aggregation for one mini-batch,
     immediately calls scaled_loss.backward(), and returns scalar tracking values.
@@ -281,14 +322,17 @@ def _compute_single_batch_losses(net, mse_cost_function, batch_dom, batch_ic,
     The only thing that differs between those two closures is *how* batch_dom
     and batch_ic were obtained (fresh random indices vs cached indices).
 
+    causal_config and iteration are forwarded to _compute_pde_losses.
+
     Returns a dict of plain Python floats suitable for logging/breakdown, plus
     the unscaled scalar loss value for this batch.
     """
     # Compute IC losses
     ic_losses = _compute_ic_losses(net, batch_ic, model, rho_1, lam, jeans, v_1, mse_cost_function, interpolators)
     
-    # Compute PDE losses
-    pde_losses = _compute_pde_losses(net, batch_dom, model, mse_cost_function)
+    # Compute PDE losses (causal weights applied inside if enabled)
+    pde_losses = _compute_pde_losses(net, batch_dom, model, mse_cost_function,
+                                     causal_config=causal_config, iteration=iteration)
     
     # Aggregate into total loss
     loss = _aggregate_losses(ic_losses, pde_losses, model)
@@ -365,7 +409,7 @@ def _build_loss_breakdown(last_scalars, model, last_data_breakdown):
 def closure_batched(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
                     rho_1, lam, jeans, v_1, batch_size, num_batches,
                     update_tracker=True, iteration=0, use_fft_poisson=None,
-                    data_terms=None, interpolators=None):
+                    data_terms=None, interpolators=None, causal_config=None):
     """
     Batched closure for Adam.
 
@@ -374,6 +418,9 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
 
     Gradients are accumulated across mini-batches (not tensors) so peak GPU
     memory stays constant regardless of num_batches.
+
+    causal_config: CausalTrainingConfig or None — forwarded to _compute_pde_losses.
+    iteration:     current Adam step, used for activate_after_iter gating.
     """
     # ── Setup ─────────────────────────────────────────────────────────────────
     if isinstance(collocation_domain, (list, tuple)):
@@ -409,7 +456,8 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
         scalars = _compute_single_batch_losses(
             net, mse_cost_function, batch_dom, batch_ic,
             model, rho_1, lam, jeans, v_1,
-            num_effective_batches, data_terms, interpolators=interpolators
+            num_effective_batches, data_terms, interpolators=interpolators,
+            causal_config=causal_config, iteration=iteration
         )
 
         total_loss_scalar += scalars['loss']
@@ -441,7 +489,7 @@ def closure_batched(model, net, mse_cost_function, collocation_domain, collocati
 def closure_batched_cached(model, net, mse_cost_function, collocation_domain, collocation_IC, optimizer,
                            rho_1, lam, jeans, v_1, batch_size, num_batches,
                            cached_dom_indices, cached_ic_indices,
-                           data_terms=None, interpolators=None):
+                           data_terms=None, interpolators=None, causal_config=None):
     """
     Batched closure for L-BFGS.
 
@@ -451,6 +499,9 @@ def closure_batched_cached(model, net, mse_cost_function, collocation_domain, co
     L-BFGS convergence. Fresh random indices (as in closure_batched) would
     make the landscape shift between line-search evaluations and break
     convergence.
+
+    causal_config: CausalTrainingConfig or None.  When enabled, causal weights
+    are always active during L-BFGS (iteration=None → no threshold check).
     """
     # ── Setup ─────────────────────────────────────────────────────────────────
     if isinstance(collocation_domain, (list, tuple)):
@@ -483,7 +534,8 @@ def closure_batched_cached(model, net, mse_cost_function, collocation_domain, co
         scalars = _compute_single_batch_losses(
             net, mse_cost_function, batch_dom, batch_ic,
             model, rho_1, lam, jeans, v_1,
-            num_effective_batches, data_terms, interpolators=interpolators
+            num_effective_batches, data_terms, interpolators=interpolators,
+            causal_config=causal_config, iteration=None  # None → always active during L-BFGS
         )
 
         total_loss_scalar += scalars['loss']

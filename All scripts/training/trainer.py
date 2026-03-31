@@ -60,10 +60,11 @@ def train(experiment, iteration_adam, iterationL, data_terms=None):
     # ----- Adam optimization phase -----
     for i in range(iteration_adam):
         loss, loss_breakdown = optimizer.step(lambda: closure_batched(
-            model, net, mse_cost_function, collocation_domain, collocation_IC, 
-            optimizer, rho_1, lam, jeans, v_1, bs, nb, update_tracker=True, 
-            iteration=i, use_fft_poisson=True, data_terms=data_terms, 
-            interpolators=interpolators
+            model, net, mse_cost_function, collocation_domain, collocation_IC,
+            optimizer, rho_1, lam, jeans, v_1, bs, nb, update_tracker=True,
+            iteration=i, use_fft_poisson=True, data_terms=data_terms,
+            interpolators=interpolators,
+            causal_config=getattr(experiment, 'causal_config', None)
         ))
 
         # Adaptive collocation: resample domain points periodically
@@ -105,7 +106,8 @@ def train(experiment, iteration_adam, iterationL, data_terms=None):
                 optimizerL, rho_1, lam, jeans, v_1, bs, nb,
                 cached_dom_indices, cached_ic_indices,
                 data_terms=data_terms,
-                interpolators=interpolators
+                interpolators=interpolators,
+                causal_config=getattr(experiment, 'causal_config', None)
             )
             loss_breakdown_holder[0] = loss_breakdown
             return loss
