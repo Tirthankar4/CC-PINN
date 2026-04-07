@@ -32,7 +32,7 @@ class PhysicsConfig:
     rho_o: float = 1.0  # Background density
     const: float = 1.0  # Poisson coupling constant (4πG)
     G: float = 1.0  # Gravitational constant
-    a: float = 0.1  # Perturbation amplitude
+    a: float = 1.1  # Perturbation amplitude
     gravity: bool = True # Enable/disable self-gravity coupling
 
 
@@ -45,7 +45,7 @@ class DomainConfig:
     ymin: float = 0.0
     zmin: float = 0.0
     tmin: float = 0.0
-    tmax: float = 3.0
+    tmax: float = 0.6
     wave: float = 7.0  # Wavelength
     num_of_waves: float = 2.0  # Number of wavelengths in domain
 
@@ -59,9 +59,9 @@ class DomainConfig:
 class TrainingConfig:
     """Training hyperparameters and collocation point settings."""
 
-    N_0: int = 25000  # Initial condition points
-    N_r: int = 70000  # Residual / collocation points
-    batch_size: int = 95000  # Max points per mini-batch
+    N_0: int = 50000  # Initial condition points
+    N_r: int = 140000  # Residual / collocation points
+    batch_size: int = 190000  # Max points per mini-batch
     num_batches: int = 1  # Mini-batches per optimizer step
     iteration_adam: int = 1001  # Adam iterations
     iteration_lbfgs: int = 201  # L-BFGS iterations
@@ -143,7 +143,7 @@ class PowerSpectrumConfig:
     n_grid_3d: int = 400
     fd_nu_power: float = 0.25
     power_exponent: int = -4
-    random_seed: int = 82  # Seed for IC field generation (big impact on field morphology)
+    random_seed: int = 4  # Seed for IC field generation (big impact on field morphology)
 
 
 @dataclass(frozen=True)
@@ -153,7 +153,7 @@ class AdaptiveCollocationConfig:
     enabled: bool = False
     resample_every_n: int = 50  # Resample every N Adam iterations
     n_candidates: int = 5000  # Candidate points generated at each resample
-    keep_fraction: float = 0.8  # Fraction of pool kept (highest-residual points)
+    keep_fraction: float = 0.5  # Fraction of pool kept (highest-residual points)
     uniform_fraction: float = 0.2  # Fraction replaced with fresh uniform points
 
 
@@ -192,9 +192,9 @@ class CausalTrainingConfig:
     """
 
     enabled: bool = True
-    epsilon: float = 5.0
-    n_time_bins: int = 20
-    activate_after_iter: int = 0
+    epsilon: float = 0.7
+    n_time_bins: int = 25
+    activate_after_iter: int = 250
 
 
 # ═══════════════════════════════════════════════════════════════

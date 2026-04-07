@@ -21,7 +21,7 @@ from typing import Optional, Callable
 from config import (cs, rho_o, N_GRID, POWER_EXPONENT, 
                     PERTURBATION_TYPE, KX, KY, KZ, RANDOM_SEED,
                     DIMENSION, N_GRID_3D)
-from numerical_solvers.LAX import generate_shared_velocity_field
+from core.field_generation import generate_shared_velocity_field
 
 
 @dataclass

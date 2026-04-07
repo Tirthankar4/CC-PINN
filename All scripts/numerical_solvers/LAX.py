@@ -11,6 +11,15 @@ from numpy.fft import fft, ifft, fft2, ifft2, fftn, ifftn
 
 from config import RANDOM_SEED, DIMENSION
 
+# Field-generation utilities live in core/ (no solver dependency).
+# They are re-exported here so that any existing code that imports them
+# from numerical_solvers.LAX continues to work unchanged.
+from core.field_generation import (
+    build_k_space_grid,
+    generate_velocity_field_power_spectrum,
+    generate_shared_velocity_field,
+)
+
 # Import wave vector components and physical constants for 2D sinusoidal perturbations
 try:
     from config import KX, KY, KZ, cs, rho_o, const, G
@@ -148,42 +157,7 @@ def compute_perturbation_velocity(rho_1, rho_o, lam, c_s, jeans, gravity):
         return v_1, alpha, False
 
 
-def build_k_space_grid(shape, domain_lengths, dimension):
-    """
-    Build k-space grid for FFT operations.
-    
-    Args:
-        shape: Tuple of grid dimensions (nx, ny) or (nx, ny, nz)
-        domain_lengths: Tuple of domain sizes (Lx, Ly) or (Lx, Ly, Lz)
-        dimension: 2 or 3
-    
-    Returns:
-        tuple: (kx, ky, kz (optional), kx_mesh, ky_mesh, kz_mesh (optional))
-            For 2D: (kx, ky, kx_mesh, ky_mesh)
-            For 3D: (kx, ky, kz, kx_mesh, ky_mesh, kz_mesh)
-    """
-    if dimension == 2:
-        nx, ny = shape
-        Lx, Ly = domain_lengths
-        dx = Lx / nx
-        dy = Ly / ny
-        kx = 2 * np.pi * np.fft.fftfreq(nx, d=dx)
-        ky = 2 * np.pi * np.fft.fftfreq(ny, d=dy)
-        kx_mesh, ky_mesh = np.meshgrid(kx, ky, indexing='ij')
-        return kx, ky, kx_mesh, ky_mesh
-    elif dimension == 3:
-        nx, ny, nz = shape
-        Lx, Ly, Lz = domain_lengths
-        dx = Lx / nx
-        dy = Ly / ny
-        dz = Lz / nz
-        kx = 2 * np.pi * np.fft.fftfreq(nx, d=dx)
-        ky = 2 * np.pi * np.fft.fftfreq(ny, d=dy)
-        kz = 2 * np.pi * np.fft.fftfreq(nz, d=dz)
-        kx_mesh, ky_mesh, kz_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
-        return kx, ky, kz, kx_mesh, ky_mesh, kz_mesh
-    else:
-        raise ValueError(f"Unsupported dimension={dimension}. Use 2 or 3.")
+# build_k_space_grid is imported from core.field_generation at the top of this file.
 
 
 def compute_adaptive_timestep(velocities, c_s, dx, nu, include_sound_speed=False):
@@ -1142,141 +1116,8 @@ def lax_solver(time, domain_params, physics_params, ic_type='sinusoidal', ic_par
     )
 
 
-def generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index=-3.0, amplitude=0.02, DIMENSION=2, random_seed=None, nz=None, Lz=None):
-    """
-    Generate 2D or 3D velocity components (vx, vy, vz (optional)) with an isotropic power-law spectrum P(k) ~ k^{power_index}.
-    
-    This function generates velocity fields directly at the target resolution (nx, ny, nz (optional))
-    without any downsampling or cutoff strategies. Dimension-agnostic implementation.
-    
-    Args:
-        nx, ny: Grid dimensions (required)
-        Lx, Ly: Domain sizes (required)
-        power_index: Power spectrum index (default: -3.0)
-        amplitude: RMS amplitude of velocity field (default: 0.02)
-        DIMENSION: 2 or 3 (default: 2)
-        random_seed: Random seed for reproducibility
-        nz, Lz: Grid dimension and domain size for 3D (required if DIMENSION=3)
-    
-    Returns:
-        For 2D: (vx, vy)
-        For 3D: (vx, vy, vz)
-    """
-    if random_seed is not None:
-        rng = np.random.default_rng(random_seed)
-    else:
-        rng = np.random.default_rng()
-
-    # Determine shape and domain lengths based on dimension
-    if DIMENSION == 2:
-        shape = (nx, ny)
-        domain_lengths = (Lx, Ly)
-    elif DIMENSION == 3:
-        if nz is None or Lz is None:
-            raise ValueError("nz and Lz must be provided for 3D")
-        shape = (nx, ny, nz)
-        domain_lengths = (Lx, Ly, Lz)
-    else:
-        raise ValueError(f"Unsupported DIMENSION={DIMENSION}. Use 2 or 3.")
-
-    def synthesize_component():
-        # 1. Generate random field at target resolution (dimension-agnostic)
-        field = rng.standard_normal(shape)
-        F = fftn(field)  # fftn works for any dimension
-        
-        # 2. Construct k-space grid at target resolution
-        k_grid = build_k_space_grid(shape, domain_lengths, DIMENSION)
-        
-        # 3. Compute |k| magnitude (dimension-agnostic)
-        if DIMENSION == 2:
-            kx, ky, kxg, kyg = k_grid
-            kk = np.sqrt(kxg**2 + kyg**2)
-        else:  # DIMENSION == 3
-            kx, ky, kz, kxg, kyg, kzg = k_grid
-            kk = np.sqrt(kxg**2 + kyg**2 + kzg**2)
-        
-        # 4. Apply power-law filter
-        filt = np.zeros_like(kk)
-        mask = kk > 0
-        filt[mask] = kk[mask]**(power_index / 2.0)
-        
-        F_filtered = F * filt
-        
-        # 5. Transform back to real space (dimension-agnostic)
-        comp = np.real(ifftn(F_filtered))
-        
-        # 6. Normalize the field
-        comp -= np.mean(comp)
-        std = np.std(comp)
-        if std > 0:
-            comp = comp * (amplitude / std)
-        
-        return comp
-
-    # Generate velocity components
-    vx0 = synthesize_component()
-    vy0 = synthesize_component()
-    
-    if DIMENSION == 3:
-        vz0 = synthesize_component()
-        return vx0, vy0, vz0
-    else:
-        return vx0, vy0
-
-def generate_shared_velocity_field(nx, ny, Lx, Ly, power_index=-4.0, amplitude=0.01, DIMENSION=2, random_seed=None, nz=None, Lz=None):
-    """
-    Generate shared velocity field for both PINN and FD to ensure identical initial conditions.
-    This function creates the velocity field once and returns both numpy arrays (for FD) 
-    and interpolation functions (for PINN). Dimension-agnostic implementation.
-    
-    Args:
-        nx, ny: Grid dimensions (required)
-        Lx, Ly: Domain sizes (required)
-        power_index: Power spectrum index (default: -4.0)
-        amplitude: RMS amplitude of velocity field (default: 0.01)
-        DIMENSION: 2 or 3 (default: 2)
-        random_seed: Random seed for reproducibility
-        nz, Lz: Grid dimension and domain size for 3D (required if DIMENSION=3)
-    
-    Returns:
-        For 2D: (vx_np, vy_np, vx_interp, vy_interp)
-        For 3D: (vx_np, vy_np, vz_np, vx_interp, vy_interp, vz_interp)
-    """
-    if random_seed is None:
-        random_seed = RANDOM_SEED
-    
-    # Generate the velocity field using the unified power spectrum generator
-    if DIMENSION == 2:
-        vx_np, vy_np = generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index, amplitude, DIMENSION=2, random_seed=random_seed)
-        velocity_arrays = [vx_np, vy_np]
-    elif DIMENSION == 3:
-        if nz is None or Lz is None:
-            raise ValueError("nz and Lz must be provided for 3D")
-        vx_np, vy_np, vz_np = generate_velocity_field_power_spectrum(nx, ny, Lx, Ly, power_index, amplitude, DIMENSION=3, random_seed=random_seed, nz=nz, Lz=Lz)
-        velocity_arrays = [vx_np, vy_np, vz_np]
-    else:
-        raise ValueError(f"Unsupported DIMENSION={DIMENSION}. Use 2 or 3.")
-    
-    # Create interpolation functions for PINN (dimension-agnostic)
-    from scipy.interpolate import RegularGridInterpolator
-    
-    # Build coordinate grids (exclude right boundary for periodic domains)
-    if DIMENSION == 2:
-        coords = (np.linspace(0, Lx, nx, endpoint=False), np.linspace(0, Ly, ny, endpoint=False))
-    else:  # DIMENSION == 3
-        coords = (np.linspace(0, Lx, nx, endpoint=False), 
-                  np.linspace(0, Ly, ny, endpoint=False),
-                  np.linspace(0, Lz, nz, endpoint=False))
-    
-    # Create interpolators for all velocity components
-    interpolators = [RegularGridInterpolator(coords, vel_array, method='linear', bounds_error=False, fill_value=0.0) 
-                     for vel_array in velocity_arrays]
-    
-    # Return arrays and interpolators
-    if DIMENSION == 2:
-        return vx_np, vy_np, interpolators[0], interpolators[1]
-    else:  # DIMENSION == 3
-        return vx_np, vy_np, vz_np, interpolators[0], interpolators[1], interpolators[2]
+# generate_velocity_field_power_spectrum and generate_shared_velocity_field
+# are imported from core.field_generation at the top of this file.
 
 def plot_results(x, y, rho0, vx0, vy0, time, rho_1, t, gravity=False, comparison=False, 
                  rho_LT=None, vx_LT=None, vy_LT=None, rho_LT_max=None, rho_max=None):

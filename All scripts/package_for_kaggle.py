@@ -15,6 +15,7 @@ OUTPUT_FILE = ROOT / "kaggle_script.py"
 PRIORITY_MODULES = [
     "config",
     "core.device",
+    "core.field_generation",
     "core.data_generator",
     "numerical_solvers.LAX",
     "numerical_solvers.LAX_torch",
